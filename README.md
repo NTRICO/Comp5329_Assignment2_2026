@@ -100,7 +100,7 @@ model_kind = "encoder_transformer"
 Uses `src/trader/encoder_transformer.py`:
 
 ```text
-FinCast forecast patch -> vanilla TransformerEncoder -> position
+FinCast forecast patch -> vanilla TransformerEncoder -> GRU -> position
 ```
 
 The direct hidden-feature branch is in `src/trader/encoder_policy.py` and

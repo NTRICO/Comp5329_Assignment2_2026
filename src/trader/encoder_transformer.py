@@ -10,11 +10,12 @@ from src.trader.cnn_gru import PolicyRollout
 
 @dataclass(frozen=True)
 class EncoderTransformerPolicyConfig:
-    """Vanilla TransformerEncoder head on top of frozen FinCast outputs."""
+    """TransformerEncoder + GRU policy on top of frozen FinCast outputs."""
 
     horizon_len: int = 5
     forecast_channels: int = 10
     model_dim: int = 64
+    state_dim: int = 64
     num_layers: int = 2
     num_heads: int = 4
     ff_dim: int = 128
@@ -26,13 +27,12 @@ class EncoderTransformerPolicyConfig:
 
 
 class EncoderTransformerPolicy(nn.Module):
-    """Frozen FinCast forecast patch -> vanilla encoder -> daily position.
+    """Frozen FinCast forecast patch -> vanilla encoder -> GRU -> position.
 
-    This is the minimal "encoder after decoder-only FinCast" variant. It uses
-    the cached FinCast distribution patch `[H, 10]` as a token sequence, applies
-    a vanilla TransformerEncoder over the horizon axis, pools the encoded tokens,
-    and outputs a bounded target position. There is no GRU state; the only
-    sequential dependency is the previous position used for trade smoothing.
+    The TransformerEncoder reads the cached FinCast distribution patch `[H, 10]`
+    over the horizon axis. Its pooled representation is then combined with the
+    previous realized position and fed into a GRUCell, so the decision head can
+    condition on both the forecast signal and the controller's position history.
     """
 
     def __init__(self, config: EncoderTransformerPolicyConfig) -> None:
@@ -55,13 +55,20 @@ class EncoderTransformerPolicy(nn.Module):
             nn.Linear(1, config.model_dim),
             nn.GELU(),
         )
+        self.core = nn.GRUCell(
+            input_size=config.model_dim * 2,
+            hidden_size=config.state_dim,
+        )
         self.target_head = nn.Sequential(
-            nn.LayerNorm(config.model_dim * 2),
-            nn.Linear(config.model_dim * 2, config.model_dim),
+            nn.LayerNorm(config.state_dim),
+            nn.Linear(config.state_dim, config.state_dim),
             nn.GELU(),
             nn.Dropout(config.dropout),
-            nn.Linear(config.model_dim, 1),
+            nn.Linear(config.state_dim, 1),
         )
+
+    def initial_state(self, batch_size: int, *, device: torch.device) -> torch.Tensor:
+        return torch.zeros(batch_size, self.config.state_dim, device=device)
 
     def encode_patch(self, patch: torch.Tensor) -> torch.Tensor:
         if patch.ndim != 3:
@@ -91,9 +98,17 @@ class EncoderTransformerPolicy(nn.Module):
                 f"prev_position must be [B] or [B,1], got {tuple(prev_position.shape)}"
             )
 
+        batch_size = patch.shape[0]
+        if prev_state is None:
+            prev_state = self.initial_state(batch_size, device=patch.device)
+
         z = self.encode_patch(patch)
         p_emb = self.position_projection(prev_position.to(dtype=z.dtype, device=z.device))
-        target_logit = self.target_head(torch.cat([z, p_emb], dim=-1)).squeeze(-1)
+        state = self.core(
+            torch.cat([z, p_emb], dim=-1),
+            prev_state.to(dtype=z.dtype, device=z.device),
+        )
+        target_logit = self.target_head(state).squeeze(-1)
         target_position = self.config.min_position + (
             self.config.max_position - self.config.min_position
         ) * torch.sigmoid(target_logit)
@@ -105,7 +120,6 @@ class EncoderTransformerPolicy(nn.Module):
         position = prev_flat + delta
         position = self._ste_round_clip(position)
         delta = position - prev_flat
-        state = torch.empty(0, device=patch.device)
         return position, delta, state, z
 
     def _ste_round_clip(self, position: torch.Tensor) -> torch.Tensor:
@@ -143,7 +157,7 @@ class EncoderTransformerPolicy(nn.Module):
         positions = []
         deltas = []
         encoded = []
-        state = torch.empty(0, device=device)
+        state = initial_state
         for t in range(seq_len):
             prev_position, delta, state, z = self.step(
                 patches[:, t],
