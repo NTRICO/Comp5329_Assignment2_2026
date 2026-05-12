@@ -1,0 +1,36 @@
+# Local environments and package caches
+.conda-fincast/
+.conda-pkgs/
+.localappdata/
+.venv/
+venv/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter scratch state
+.ipynb_checkpoints/
+
+# Frozen upstream dependency. Clone separately or add as a submodule.
+FinCast-fts/
+
+# Large model weights and generated artifacts
+models/
+data/cache/
+outputs/
+
+# Local logs and temporary files
+*.log
+*.tmp
+*.bak
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

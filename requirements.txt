@@ -1,0 +1,10 @@
+numpy
+pandas
+matplotlib
+torch
+yfinance==0.2.55
+scikit-learn
+PyYAML
+ipykernel
+notebook
+jupyterlab
