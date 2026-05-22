@@ -18,10 +18,14 @@ __pycache__/
 
 # Frozen upstream dependency. Clone separately or add as a submodule.
 FinCast-fts/
+third_party/PatchTST/
 
 # Large model weights and generated artifacts
 models/
 data/cache/
+data/fincast_inputs/
+data/high-frequency/
+data/raw/FinCast-Paper-test/
 outputs/
 
 # Local logs and temporary files

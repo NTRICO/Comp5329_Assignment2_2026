@@ -1,0 +1,15 @@
+metric,value
+rows,30632.0
+assets,8.0
+time_ids,3829.0
+features,73.0
+feature_nan_cells,0.0
+feature_inf_cells,0.0
+return_nan_cells,0.0
+return_inf_cells,0.0
+duplicate_asset_time_ids,0.0
+return_mean,2.379747360797718e-05
+return_std,0.007004170706158663
+return_positive_rate,0.5010120135805693
+return_p01,-0.020054077692329884
+return_p99,0.020532567687332456

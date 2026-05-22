@@ -1,114 +1,137 @@
-# COMP5329 FinCast Position Trader
+# COMP5329 PatchTST Optimization for Financial Time Series
 
-This project builds a position-aware daily trader on top of frozen FinCast forecasts.
-FinCast is treated as an external dependency: it generates predictive distributions,
-while this repository contains the data pipeline, cache builders, trader heads,
-training notebooks, baselines, and evaluation scaffolding.
+This repository is now organized around optimizing and stress-testing PatchTST
+for noisy financial time-series forecasting. The earlier FinCast position-trader
+pipeline remains in the codebase as historical baseline infrastructure, but the
+main assignment direction is PatchTST-centric model adaptation.
 
-## Layout
+The current experiments focus on:
+
+- multi-scale PatchTST baselines on second, minute, hour, day, and week data;
+- Optiver high-frequency feature caches and FinCast-Paper-test benchmarks;
+- lightweight denoising and adaptation modules around PatchTST;
+- robustness checks that compare raw PatchTST against ASD, LoRA-MoE, and
+  supplementary multi-channel or level-domain variants.
+
+## Project Layout
 
 ```text
 src/
-  baselines/          Mean-variance and other comparison strategies
-  datasets/           ETF data loading and cached sequence datasets
-  fincast_io/         FinCast wrapper, forecast cache, encoder feature cache
-  trader/             Trader heads: cnn_gru, encoder_transformer, encoder_policy
-  training/           Mean-variance-turnover loss and train/eval loops
+  baselines/
+    patchtst_lora.py              Self-contained PatchTST + LoRA baseline
+    scale_aware_asd_patchtst.py   Scale-aware ASD / adapter modules
+    position_rules.py             Simple policy baselines for legacy tests
+  datasets/
+    optiver_features.py           Optiver high-frequency feature utilities
+    trader_dataset.py             Legacy and cache-backed sequence datasets
+  eval/
+    metrics.py                    Forecasting and backtest metrics
+    backtest.py                   Legacy policy/backtest utilities
+  fincast_io/
+    simple_forecaster.py          Lightweight FinCast-style forecaster helpers
+  trader/
+    ...                           Historical position-trader components
 scripts/
-  build_fincast_cache.py
-  build_encoder_cache.py
-  train_trader.py
-notebooks/
-  01_data_exploration.ipynb
-  02_trader_training.ipynb
-  03_fincast_smoke_test.ipynb
-data/raw/
-  etf_daily_close.csv
+  evaluate_*patchtst*.py          PatchTST benchmark and ablation entrypoints
+  build_optiver_*.py              Optiver feature/cache builders
+  train_patchtst_lora.py          Daily-cache PatchTST LoRA baseline
+  train_trader.py                 Historical FinCast trader trainer
+report/
+  README.md                       Current PatchTST result index
+  *_patchtst*.md                  Experiment notes and robustness reports
+tests/
+  test_*patchtst*.py              PatchTST and adapter smoke tests
+  test_optiver_features.py        Feature/cache tests
 ```
 
-## External Files
+## Local Artifacts
 
-These files are required locally but are intentionally not committed:
+Large datasets, checkpoints, and generated outputs are intentionally kept local.
+They are required to reproduce the experiments, but they should not be committed:
 
 ```text
-FinCast-fts/                 Frozen upstream FinCast source tree
-models/FinCast/v1.pth        FinCast checkpoint
-data/cache/*.npz             Generated forecast/encoder caches
-outputs/checkpoints/*.pt     Trained trader checkpoints
-.conda-fincast/              Local Python environment
+.conda-fincast/                         Local Python environment
+FinCast-fts/                            Frozen upstream FinCast source tree
+third_party/PatchTST/                   Local PatchTST reference checkout
+models/                                 Local checkpoints
+data/cache/                             Generated NPZ caches
+data/high-frequency/                    Optiver high-frequency source data
+data/fincast_inputs/                    Generated FinCast-style inputs
+data/raw/FinCast-Paper-test/            Local copy of the paper-test data
+outputs/                                Experiment outputs and checkpoints
 ```
 
-Clone FinCast separately at the project root:
+Use the local project interpreter for experiments:
 
 ```powershell
-git clone https://github.com/vincent05r/FinCast-fts.git FinCast-fts
+& ".\.conda-fincast\python.exe" <script>
 ```
 
-Place the FinCast checkpoint at:
+The system Python is not the reliable environment for this checkout.
+
+## Main Experiment Entrypoints
+
+Vanilla PatchTST and time-scale baselines:
+
+```powershell
+& ".\.conda-fincast\python.exe" scripts\evaluate_vanilla_timescales_additional_stock.py
+& ".\.conda-fincast\python.exe" scripts\evaluate_abc_vanilla_timescales.py
+& ".\.conda-fincast\python.exe" scripts\evaluate_hf_fincast_paper_test.py
+```
+
+Spectral denoising and scale-aware ASD:
+
+```powershell
+& ".\.conda-fincast\python.exe" scripts\evaluate_optiver_spectral_denoise_patchtst.py
+& ".\.conda-fincast\python.exe" scripts\evaluate_scale_aware_asd_patchtst.py
+```
+
+Supplementary model variants:
+
+```powershell
+& ".\.conda-fincast\python.exe" scripts\train_patchtst_lora.py
+& ".\.conda-fincast\python.exe" scripts\evaluate_level_asd_patchtst.py
+& ".\.conda-fincast\python.exe" scripts\evaluate_multichannel_patchtst.py
+```
+
+Historical FinCast trader commands are still available, but they are no longer
+the primary narrative for the assignment.
+
+## Evidence Map
+
+The concise report index is:
 
 ```text
-models/FinCast/v1.pth
+report/README.md
 ```
 
-See `FINCAST_SETUP.md` for the local CUDA/PyTorch environment notes.
+It records the committed, human-readable evidence tables for:
 
-## Current Pipeline
+- vanilla PatchTST and FinCast-Paper-test baselines;
+- raw vs spectral-denoised PatchTST;
+- scale-aware ASD robustness;
+- ASD + LoRA-MoE guardrails;
+- multi-channel and level-ASD supplementary runs.
 
-1. Daily ETF close data lives in `data/raw/etf_daily_close.csv`.
-2. Frozen FinCast generates a daily cache:
+Generated CSV/JSON/PNG artifacts remain under `outputs/` for local inspection.
 
-   ```powershell
-   & ".\.conda-fincast\python.exe" scripts\build_fincast_cache.py
-   ```
+## Testing
 
-   Default output:
+Run focused tests with the local interpreter:
 
-   ```text
-   data/cache/position_fincast_daily_cache.npz
-   ```
-
-3. Train the trader from the daily cache:
-
-   ```powershell
-   & ".\.conda-fincast\python.exe" scripts\train_trader.py
-   ```
-
-4. Main notebook workflow:
-
-   ```text
-   notebooks/02_trader_training.ipynb
-   ```
-
-## Trader Heads
-
-Two main policy heads are available:
-
-```text
-model_kind = "cnn_gru"
+```powershell
+& ".\.conda-fincast\python.exe" -m pytest tests
 ```
 
-Uses `src/trader/cnn_gru.py`:
-
-```text
-FinCast forecast patch -> Conv1D encoder -> GRU -> position
-```
-
-```text
-model_kind = "encoder_transformer"
-```
-
-Uses `src/trader/encoder_transformer.py`:
-
-```text
-FinCast forecast patch -> vanilla TransformerEncoder -> GRU -> position
-```
-
-The direct hidden-feature branch is in `src/trader/encoder_policy.py` and
-`scripts/build_encoder_cache.py`.
+If `pytest` is unavailable in the local environment, run the relevant test
+modules directly or install the test dependency in `.conda-fincast`.
 
 ## Notes
 
-- FinCast stays frozen; do not modify `FinCast-fts/` for trader experiments.
-- Current daily label is next trading day return: `holding_horizon=1`.
-- Current split is time-based per ETF: first 80% train, last 20% test.
-- Cache and checkpoint artifacts are reproducible and excluded from Git.
+- PatchTST is treated as a forecasting backbone, not a trading policy.
+- Strong zero-return baselines are expected on several financial forecasting
+  surfaces, so results should be interpreted against zero and last-return rows.
+- Hour-scale results often have much smaller test counts than second-scale
+  results; report them with the corresponding sample-size caveat.
+- FinCast remains useful as a benchmark and data source, but the project story is
+  PatchTST optimization.

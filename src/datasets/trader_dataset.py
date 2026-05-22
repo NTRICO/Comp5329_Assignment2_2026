@@ -31,6 +31,7 @@ class CachedDistributionDataset(Dataset):
         forecast_risk: torch.Tensor | None = None,
         stride: int | None = None,
         asset_names: np.ndarray | None = None,
+        episode_ids: np.ndarray | None = None,
     ) -> None:
         super().__init__()
         patches = torch.as_tensor(patches, dtype=torch.float32)
@@ -50,6 +51,7 @@ class CachedDistributionDataset(Dataset):
         self.seq_len = int(seq_len)
         self.stride = int(stride or seq_len)
         self.asset_names: np.ndarray | None = None
+        self.episode_ids: np.ndarray | None = None
         if self.stride <= 0:
             raise ValueError("stride must be positive.")
 
@@ -62,15 +64,30 @@ class CachedDistributionDataset(Dataset):
             self.forecast_risk = risk
 
         self.starts: list[int] = []
-        if asset_names is None:
-            if patches.shape[0] < self.seq_len:
-                raise ValueError("Not enough samples for the requested seq_len.")
-            self.starts = list(range(0, patches.shape[0] - self.seq_len + 1, self.stride))
-        else:
+        if asset_names is not None:
             asset_names = np.asarray(asset_names)
             if asset_names.shape[0] != patches.shape[0]:
                 raise ValueError("asset_names must have one entry per patch.")
             self.asset_names = asset_names
+        if episode_ids is not None:
+            episode_ids = np.asarray(episode_ids)
+            if episode_ids.shape[0] != patches.shape[0]:
+                raise ValueError("episode_ids must have one entry per patch.")
+            self.episode_ids = episode_ids
+            for run_start, run_end in _contiguous_runs(episode_ids):
+                run_length = run_end - run_start
+                if run_length < self.seq_len:
+                    continue
+                last_start = run_end - self.seq_len
+                for s in range(run_start, last_start + 1, self.stride):
+                    self.starts.append(s)
+            if not self.starts:
+                raise ValueError("No episode has enough samples for the requested seq_len.")
+        elif asset_names is None:
+            if patches.shape[0] < self.seq_len:
+                raise ValueError("Not enough samples for the requested seq_len.")
+            self.starts = list(range(0, patches.shape[0] - self.seq_len + 1, self.stride))
+        else:
             for run_start, run_end in _contiguous_runs(asset_names):
                 run_length = run_end - run_start
                 if run_length < self.seq_len:
@@ -112,6 +129,7 @@ class CachedFeatureDataset(Dataset):
         seq_len: int = 32,
         stride: int | None = None,
         asset_names: np.ndarray | None = None,
+        episode_ids: np.ndarray | None = None,
     ) -> None:
         super().__init__()
         features = torch.as_tensor(features, dtype=torch.float32)
@@ -131,19 +149,35 @@ class CachedFeatureDataset(Dataset):
         self.seq_len = int(seq_len)
         self.stride = int(stride or seq_len)
         self.asset_names: np.ndarray | None = None
+        self.episode_ids: np.ndarray | None = None
         if self.stride <= 0:
             raise ValueError("stride must be positive.")
 
         self.starts: list[int] = []
-        if asset_names is None:
-            if features.shape[0] < self.seq_len:
-                raise ValueError("Not enough samples for the requested seq_len.")
-            self.starts = list(range(0, features.shape[0] - self.seq_len + 1, self.stride))
-        else:
+        if asset_names is not None:
             asset_names = np.asarray(asset_names)
             if asset_names.shape[0] != features.shape[0]:
                 raise ValueError("asset_names must have one entry per feature row.")
             self.asset_names = asset_names
+        if episode_ids is not None:
+            episode_ids = np.asarray(episode_ids)
+            if episode_ids.shape[0] != features.shape[0]:
+                raise ValueError("episode_ids must have one entry per feature row.")
+            self.episode_ids = episode_ids
+            for run_start, run_end in _contiguous_runs(episode_ids):
+                run_length = run_end - run_start
+                if run_length < self.seq_len:
+                    continue
+                last_start = run_end - self.seq_len
+                for s in range(run_start, last_start + 1, self.stride):
+                    self.starts.append(s)
+            if not self.starts:
+                raise ValueError("No episode has enough samples for the requested seq_len.")
+        elif asset_names is None:
+            if features.shape[0] < self.seq_len:
+                raise ValueError("Not enough samples for the requested seq_len.")
+            self.starts = list(range(0, features.shape[0] - self.seq_len + 1, self.stride))
+        else:
             for run_start, run_end in _contiguous_runs(asset_names):
                 run_length = run_end - run_start
                 if run_length < self.seq_len:
@@ -179,8 +213,32 @@ def time_ordered_train_test_indices(
     concatenated cache.
     """
 
+    train_indices, validation_indices, test_indices = time_ordered_train_validation_test_indices(
+        dataset,
+        validation_fraction=0.0,
+        test_fraction=test_fraction,
+    )
+    return train_indices + validation_indices, test_indices
+
+
+def time_ordered_train_validation_test_indices(
+    dataset: CachedDistributionDataset | CachedFeatureDataset,
+    *,
+    validation_fraction: float = 0.1,
+    test_fraction: float = 0.2,
+) -> tuple[list[int], list[int], list[int]]:
+    """Split sequence indices by time order into train/validation/test.
+
+    The split is applied independently within each asset, preserving chronology
+    and keeping the final time block for test. Defaults are 70/10/20.
+    """
+
+    if not 0.0 <= validation_fraction < 1.0:
+        raise ValueError("validation_fraction must be in [0, 1).")
     if not 0.0 < test_fraction < 1.0:
         raise ValueError("test_fraction must be between 0 and 1.")
+    if validation_fraction + test_fraction >= 1.0:
+        raise ValueError("validation_fraction + test_fraction must be less than 1.")
 
     groups: dict[str, list[int]] = {}
     for dataset_index, start in enumerate(dataset.starts):
@@ -191,18 +249,26 @@ def time_ordered_train_test_indices(
         groups.setdefault(asset, []).append(dataset_index)
 
     train_indices: list[int] = []
+    validation_indices: list[int] = []
     test_indices: list[int] = []
     for asset, indices in groups.items():
         n_total = len(indices)
         n_test = max(1, int(n_total * test_fraction))
-        n_train = n_total - n_test
+        n_validation = (
+            max(1, int(n_total * validation_fraction))
+            if validation_fraction > 0.0
+            else 0
+        )
+        n_train = n_total - n_validation - n_test
         if n_train <= 0:
             raise ValueError(
-                f"Not enough sequences for the requested test_fraction in asset {asset!r}."
+                "Not enough sequences for the requested validation/test fractions "
+                f"in asset {asset!r}."
             )
         train_indices.extend(indices[:n_train])
-        test_indices.extend(indices[n_train:])
-    return train_indices, test_indices
+        validation_indices.extend(indices[n_train : n_train + n_validation])
+        test_indices.extend(indices[n_train + n_validation :])
+    return train_indices, validation_indices, test_indices
 
 
 def _contiguous_runs(asset_names: np.ndarray) -> list[tuple[int, int]]:

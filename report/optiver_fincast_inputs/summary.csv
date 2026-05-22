@@ -1,0 +1,12 @@
+metric,value
+contexts,428960
+context_len,128
+horizon_len,32
+stride,32
+stocks,8
+episodes,30640
+return_mean,-1.2876994e-06
+return_std,0.0010051418
+return_q01,-0.0029661304
+return_q50,0
+return_q99,0.0029133833

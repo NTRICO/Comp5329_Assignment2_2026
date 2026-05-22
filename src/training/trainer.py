@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from typing import Any
 
 import torch
 
 from .losses import MeanVarianceTurnoverLoss, PositionLossBreakdown
-from src.trader.cnn_gru import PositionAwareGRUPolicy, PolicyRollout
 
 
 def move_batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
@@ -13,12 +13,12 @@ def move_batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) -
 
 
 def policy_loss_on_batch(
-    model: PositionAwareGRUPolicy,
+    model: torch.nn.Module,
     loss_fn: MeanVarianceTurnoverLoss,
     batch: dict[str, torch.Tensor],
     *,
     initial_position: float = 0.0,
-) -> tuple[PolicyRollout, PositionLossBreakdown]:
+) -> tuple[Any, PositionLossBreakdown]:
     if "patches" in batch:
         model_input = batch["patches"]
     elif "features" in batch:
@@ -36,7 +36,7 @@ def policy_loss_on_batch(
 
 
 def train_one_epoch(
-    model: PositionAwareGRUPolicy,
+    model: torch.nn.Module,
     loss_fn: MeanVarianceTurnoverLoss,
     loader: Iterable[dict[str, torch.Tensor]],
     optimizer: torch.optim.Optimizer,
@@ -80,7 +80,7 @@ def train_one_epoch(
 
 @torch.no_grad()
 def evaluate_policy(
-    model: PositionAwareGRUPolicy,
+    model: torch.nn.Module,
     loss_fn: MeanVarianceTurnoverLoss,
     loader: Iterable[dict[str, torch.Tensor]],
     *,
