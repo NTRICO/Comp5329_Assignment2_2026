@@ -167,6 +167,10 @@ def build_level_arrays(
     time_ids = np.asarray(arrays["time_ids"], dtype=np.int64)
     seconds = np.asarray(arrays["seconds_in_bucket"], dtype=np.int64)
     feature_names = [str(name) for name in arrays["feature_names"]]
+    if "seconds_per_bucket" in arrays:
+        seconds_per_bucket = int(np.asarray(arrays["seconds_per_bucket"]).reshape(-1)[0])
+    else:
+        seconds_per_bucket = int(seconds.max()) + 1 if len(seconds) else 600
     if "wap1" not in feature_names:
         raise ValueError("wap1 is required for price-domain ASD.")
     wap1_index = feature_names.index("wap1")
@@ -255,7 +259,11 @@ def build_level_arrays(
                         ),
                     )
                 if "minute" in scales:
-                    minute_levels = aggregate_minute_levels(features[idx, wap1_index], seconds[idx])
+                    minute_levels = aggregate_minute_levels(
+                        features[idx, wap1_index],
+                        seconds[idx],
+                        seconds_per_bucket=seconds_per_bucket,
+                    )
                     add_built_window(
                         by_scale["minute"],
                         split_name,
@@ -276,6 +284,7 @@ def build_level_arrays(
                 "price_mode": price_mode,
                 "context_length": int(scale_specs[scale].context_length),
                 "target_horizon_steps": int(TARGET_HORIZON_STEPS[scale]),
+                "seconds_per_bucket": int(seconds_per_bucket),
             }
         }
         for split_name in ["train", "validation", "test", "zero_shot"]:

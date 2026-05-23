@@ -320,6 +320,10 @@ def build_datasets(
     time_ids = np.asarray(arrays["time_ids"], dtype=np.int64)
     seconds = np.asarray(arrays["seconds_in_bucket"], dtype=np.int64)
     feature_names = [str(name) for name in arrays["feature_names"]]
+    if "seconds_per_bucket" in arrays:
+        seconds_per_bucket = int(np.asarray(arrays["seconds_per_bucket"]).reshape(-1)[0])
+    else:
+        seconds_per_bucket = int(seconds.max()) + 1 if len(seconds) else 600
     if feature_name not in feature_names:
         raise ValueError(f"feature {feature_name!r} not found. Available: {feature_names}")
     feature_index = feature_names.index(feature_name)
@@ -341,6 +345,7 @@ def build_datasets(
         "scale": scale,
         "context_length": int(context_length),
         "target_horizon_steps": int(target_horizon_steps),
+        "seconds_per_bucket": int(seconds_per_bucket),
         "feature_names": feature_names,
         "source_files": [str(path) for path in arrays["source_files"]],
         "splits": {},
@@ -403,7 +408,11 @@ def build_datasets(
                         target_horizon_steps=target_horizon_steps,
                     )
                 elif scale == "minute":
-                    minute_levels = aggregate_minute_levels(features[idx, wap1_index], seconds[idx])
+                    minute_levels = aggregate_minute_levels(
+                        features[idx, wap1_index],
+                        seconds[idx],
+                        seconds_per_bucket=seconds_per_bucket,
+                    )
                     built = build_windows_from_levels(
                         levels=minute_levels,
                         context_length=context_length,
@@ -483,13 +492,19 @@ def build_windows_from_levels(
     )
 
 
-def aggregate_minute_levels(levels: np.ndarray, seconds: np.ndarray) -> np.ndarray:
+def aggregate_minute_levels(
+    levels: np.ndarray,
+    seconds: np.ndarray,
+    *,
+    seconds_per_bucket: int = 600,
+) -> np.ndarray:
     levels = np.asarray(levels, dtype=np.float32)
     seconds = np.asarray(seconds, dtype=np.int64)
     minute_levels = []
-    for minute in range(10):
+    n_minutes = int(math.ceil(float(seconds_per_bucket) / 60.0))
+    for minute in range(n_minutes):
         start = minute * 60
-        stop = min((minute + 1) * 60, 600)
+        stop = min((minute + 1) * 60, int(seconds_per_bucket))
         positions = np.flatnonzero((seconds >= start) & (seconds < stop))
         if len(positions):
             minute_levels.append(float(levels[positions[-1]]))

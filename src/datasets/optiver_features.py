@@ -32,6 +32,8 @@ class OptiverFeatureCache:
     source_files: list[str]
     seconds_in_bucket: np.ndarray | None = None
     episode_ids: np.ndarray | None = None
+    seconds_per_bucket: int | None = None
+    stock_id_map: np.ndarray | None = None
     data_frequency: str = "optiver_time_id"
     feature_source: str = "optiver_engineered_book_features"
 
@@ -161,10 +163,125 @@ def build_optiver_second_feature_cache_from_dir(
         time_ids=np.concatenate(time_id_blocks, axis=0).astype(np.int64),
         seconds_in_bucket=np.concatenate(second_blocks, axis=0).astype(np.int16),
         episode_ids=np.concatenate(episode_blocks, axis=0).astype(np.int64),
+        seconds_per_bucket=int(seconds_per_bucket),
         feature_names=feature_names or [],
         source_files=source_files,
         data_frequency="optiver_second",
         feature_source="optiver_second_engineered_book_features",
+    )
+
+
+def build_optiver_additional_second_feature_cache_from_dir(
+    input_dir: str | Path,
+    *,
+    max_stocks: int | None = 10,
+    max_time_ids_per_stock: int | None = 512,
+    stock_ids: list[int] | None = None,
+    seconds_per_bucket: int = 3600,
+    chunksize: int = 1_000_000,
+    map_stock_ids_to_dense: bool = True,
+    assume_stock_sorted: bool = True,
+) -> OptiverFeatureCache:
+    """Build a true-hour per-second cache from Optiver additional data.
+
+    The additional data stores each hour in two files: `order_book_feature`
+    contains seconds 0-1799 and `order_book_target` contains seconds
+    1800-3599. This builder combines them back into one hour-long episode so
+    the existing second/minute/hour PatchTST runners can slice windows without
+    crossing an hourly `time_id` boundary.
+    """
+
+    input_dir = Path(input_dir)
+    feature_path = input_dir / "order_book_feature.csv"
+    target_path = input_dir / "order_book_target.csv"
+    train_path = input_dir / "train.csv"
+    if not feature_path.exists() or not target_path.exists():
+        raise ValueError(f"Missing order_book_feature.csv/order_book_target.csv in {input_dir}.")
+    if seconds_per_bucket <= 1:
+        raise ValueError("seconds_per_bucket must be greater than 1.")
+
+    selected_raw_stock_ids = _select_additional_stock_ids(
+        train_path=train_path,
+        stock_ids=stock_ids,
+        max_stocks=max_stocks,
+    )
+    selected_time_ids_by_stock = _select_additional_time_ids_by_stock(
+        train_path=train_path,
+        stock_ids=selected_raw_stock_ids,
+        max_time_ids_per_stock=max_time_ids_per_stock,
+    )
+    dense_by_raw = {
+        raw_stock_id: dense_id if map_stock_ids_to_dense else raw_stock_id
+        for dense_id, raw_stock_id in enumerate(selected_raw_stock_ids)
+    }
+
+    frames_by_stock = _read_additional_order_book_frames(
+        paths=[feature_path, target_path],
+        selected_time_ids_by_stock=selected_time_ids_by_stock,
+        chunksize=chunksize,
+        assume_stock_sorted=assume_stock_sorted,
+    )
+
+    feature_blocks: list[np.ndarray] = []
+    return_blocks: list[np.ndarray] = []
+    asset_blocks: list[np.ndarray] = []
+    time_id_blocks: list[np.ndarray] = []
+    second_blocks: list[np.ndarray] = []
+    episode_blocks: list[np.ndarray] = []
+    feature_names: list[str] | None = None
+
+    for raw_stock_id in selected_raw_stock_ids:
+        parts = frames_by_stock.get(raw_stock_id, [])
+        if not parts:
+            continue
+        stock_frame = pd.concat(parts, ignore_index=True)
+        dense_stock_id = dense_by_raw[raw_stock_id]
+        (
+            stock_features,
+            stock_returns,
+            stock_time_ids,
+            stock_seconds,
+            names,
+        ) = build_optiver_stock_second_features(
+            stock_frame,
+            stock_id=int(dense_stock_id),
+            max_time_ids=None,
+            seconds_per_bucket=seconds_per_bucket,
+        )
+        if len(stock_returns) == 0:
+            continue
+        if feature_names is None:
+            feature_names = names
+        elif feature_names != names:
+            raise ValueError("Feature names changed across stocks.")
+
+        feature_blocks.append(stock_features)
+        return_blocks.append(stock_returns)
+        asset_blocks.append(np.asarray([f"stock_{dense_stock_id}"] * len(stock_returns)))
+        time_id_blocks.append(stock_time_ids)
+        second_blocks.append(stock_seconds)
+        episode_blocks.append((int(dense_stock_id) * 1_000_000 + stock_time_ids).astype(np.int64))
+
+    if not feature_blocks:
+        raise ValueError("No usable additional-data feature rows were built.")
+
+    stock_id_map = np.asarray(
+        [[int(dense_by_raw[raw_stock_id]), int(raw_stock_id)] for raw_stock_id in selected_raw_stock_ids],
+        dtype=np.int64,
+    )
+    return OptiverFeatureCache(
+        features=np.concatenate(feature_blocks, axis=0).astype(np.float32),
+        realized_returns=np.concatenate(return_blocks, axis=0).astype(np.float32),
+        asset_names=np.concatenate(asset_blocks, axis=0),
+        time_ids=np.concatenate(time_id_blocks, axis=0).astype(np.int64),
+        seconds_in_bucket=np.concatenate(second_blocks, axis=0).astype(np.int16),
+        episode_ids=np.concatenate(episode_blocks, axis=0).astype(np.int64),
+        seconds_per_bucket=int(seconds_per_bucket),
+        stock_id_map=stock_id_map,
+        feature_names=feature_names or [],
+        source_files=[str(feature_path), str(target_path), str(train_path)],
+        data_frequency="optiver_additional_true_hour_second",
+        feature_source="optiver_additional_combined_feature_target_book_features",
     )
 
 
@@ -359,11 +476,101 @@ def save_optiver_feature_cache(cache: OptiverFeatureCache, output_path: str | Pa
         arrays["seconds_in_bucket"] = cache.seconds_in_bucket
     if cache.episode_ids is not None:
         arrays["episode_ids"] = cache.episode_ids
+    if cache.seconds_per_bucket is not None:
+        arrays["seconds_per_bucket"] = np.asarray(cache.seconds_per_bucket, dtype=np.int64)
+    if cache.stock_id_map is not None:
+        arrays["stock_id_map"] = cache.stock_id_map
     np.savez(
         output_path,
         **arrays,
     )
     return output_path
+
+
+def _select_additional_stock_ids(
+    *,
+    train_path: Path,
+    stock_ids: list[int] | None,
+    max_stocks: int | None,
+) -> list[int]:
+    if stock_ids:
+        selected = sorted({int(stock_id) for stock_id in stock_ids})
+    else:
+        if not train_path.exists():
+            raise ValueError(f"Missing train.csv for stock selection: {train_path}")
+        train = pd.read_csv(train_path, usecols=["stock_id"])
+        selected = sorted(int(stock_id) for stock_id in train["stock_id"].dropna().unique())
+        if max_stocks is not None:
+            selected = selected[: int(max_stocks)]
+    if not selected:
+        raise ValueError("No additional-data stock ids selected.")
+    return selected
+
+
+def _select_additional_time_ids_by_stock(
+    *,
+    train_path: Path,
+    stock_ids: list[int],
+    max_time_ids_per_stock: int | None,
+) -> dict[int, set[int]]:
+    if not train_path.exists():
+        raise ValueError(f"Missing train.csv for time_id selection: {train_path}")
+    train = pd.read_csv(train_path, usecols=["stock_id", "time_id"])
+    out: dict[int, set[int]] = {}
+    for stock_id in stock_ids:
+        stock_times = np.sort(train.loc[train["stock_id"] == stock_id, "time_id"].dropna().unique())
+        if max_time_ids_per_stock is not None:
+            stock_times = stock_times[: int(max_time_ids_per_stock)]
+        out[int(stock_id)] = {int(time_id) for time_id in stock_times}
+    return out
+
+
+def _read_additional_order_book_frames(
+    *,
+    paths: list[Path],
+    selected_time_ids_by_stock: dict[int, set[int]],
+    chunksize: int,
+    assume_stock_sorted: bool,
+) -> dict[int, list[pd.DataFrame]]:
+    selected_stock_ids = sorted(selected_time_ids_by_stock)
+    selected_set = set(selected_stock_ids)
+    max_selected_stock = max(selected_stock_ids)
+    frames_by_stock: dict[int, list[pd.DataFrame]] = {stock_id: [] for stock_id in selected_stock_ids}
+    dtype = {
+        "stock_id": "int64",
+        "time_id": "int64",
+        "seconds_in_bucket": "float64",
+        "bid_price1": "float64",
+        "ask_price1": "float64",
+        "bid_price2": "float64",
+        "ask_price2": "float64",
+        "bid_size1": "float64",
+        "ask_size1": "float64",
+        "bid_size2": "float64",
+        "ask_size2": "float64",
+    }
+    for path in paths:
+        for chunk in pd.read_csv(
+            path,
+            sep="\t",
+            usecols=BOOK_COLUMNS,
+            dtype=dtype,
+            chunksize=int(chunksize),
+        ):
+            if assume_stock_sorted and len(chunk) and int(chunk["stock_id"].min()) > max_selected_stock:
+                break
+            chunk = chunk[chunk["stock_id"].isin(selected_set)].copy()
+            if chunk.empty:
+                continue
+            chunk["seconds_in_bucket"] = chunk["seconds_in_bucket"].round().astype(np.int64)
+            for stock_id, stock_chunk in chunk.groupby("stock_id", sort=False):
+                keep_times = selected_time_ids_by_stock.get(int(stock_id), set())
+                if not keep_times:
+                    continue
+                stock_chunk = stock_chunk[stock_chunk["time_id"].isin(keep_times)]
+                if not stock_chunk.empty:
+                    frames_by_stock[int(stock_id)].append(stock_chunk)
+    return frames_by_stock
 
 
 def _add_microstructure_columns(df: pd.DataFrame) -> None:

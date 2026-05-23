@@ -42,40 +42,7 @@ from evaluate_scale_aware_asd_patchtst import (  # noqa: E402
 
 
 DEFAULT_TRAIN_STOCKS = ",".join(
-    str(item)
-    for item in [
-        0,
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7,
-        8,
-        9,
-        10,
-        11,
-        13,
-        14,
-        15,
-        16,
-        17,
-        18,
-        19,
-        20,
-        21,
-        22,
-        23,
-        26,
-        27,
-        28,
-        29,
-        30,
-        31,
-        32,
-        33,
-    ]
+    str(item) for item in range(9)
 )
 
 
@@ -89,21 +56,21 @@ def parse_args() -> argparse.Namespace:
             WORKSPACE_ROOT
             / "data"
             / "cache"
-            / "position_optiver_hf_second_feature_cache_32stocks_512t.npz"
+            / "position_optiver_additional_true_hour_second_feature_cache_10stocks_512h.npz"
         ),
     )
     parser.add_argument(
         "--output-dir",
-        default=str(WORKSPACE_ROOT / "outputs" / "multichannel_asd_lora_moe_32stock_multiseed"),
+        default=str(WORKSPACE_ROOT / "outputs" / "multichannel_asd_lora_moe_true_hour_60_30_10_h10"),
     )
     parser.add_argument(
         "--report-path",
-        default=str(WORKSPACE_ROOT / "report" / "multichannel_asd_lora_moe_32stock_multiseed.md"),
+        default=str(WORKSPACE_ROOT / "report" / "multichannel_asd_lora_moe_true_hour_60_30_10_h10.md"),
     )
     parser.add_argument("--train-stocks", default=DEFAULT_TRAIN_STOCKS)
-    parser.add_argument("--zero-shot-stock", type=int, default=34)
+    parser.add_argument("--zero-shot-stock", type=int, default=9)
     parser.add_argument("--scales", nargs="+", choices=SCALE_ORDER, default=list(SCALE_ORDER))
-    parser.add_argument("--patch-preset", choices=sorted(PATCH_PRESETS), default="short_second")
+    parser.add_argument("--patch-preset", choices=sorted(PATCH_PRESETS), default="balanced_60_30_10")
     parser.add_argument("--d-model", type=int, default=64)
     parser.add_argument("--n-heads", type=int, default=4)
     parser.add_argument("--n-layers", type=int, default=2)
@@ -148,6 +115,8 @@ def parse_args() -> argparse.Namespace:
         parser.add_argument(f"--{scale}-context-length", type=int, default=None)
         parser.add_argument(f"--{scale}-patch-length", type=int, default=None)
         parser.add_argument(f"--{scale}-patch-stride", type=int, default=None)
+        target_default = 10 if scale == "second" else 1
+        parser.add_argument(f"--{scale}-target-horizon-steps", type=int, default=target_default)
     return parser.parse_args()
 
 

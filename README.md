@@ -37,6 +37,15 @@ multi-seed runner:
 .\.conda-fincast\python.exe scripts\evaluate_gated_pre_asd_32stock_multiseed.py
 ```
 
+The current true-hour target protocol uses a 60/30/10 context layout and a
+10-second cumulative target for the second scale:
+
+```text
+second -> context 60 seconds, predict next 10-second cumulative return
+minute -> context 30 minutes, predict next 1-minute return
+hour   -> context 10 true-hour time_ids, predict next true-hour return
+```
+
 The strongest follow-up candidate is the 15-channel variant:
 
 ```text
@@ -69,7 +78,8 @@ src/baselines/scale_aware_asd_patchtst.py
     multi-channel support, and experimental variants.
 
 scripts/evaluate_gated_pre_asd_32stock_multiseed.py
-    Main 32-stock multi-seed confirmation for the selected robust model.
+    Main multi-seed confirmation for the selected robust model. The current
+    defaults use the additional-data true-hour cache and 60/30/10 context.
 
 scripts/evaluate_multichannel_patchtst.py
 scripts/evaluate_multichannel_patchtst_multiseed.py
@@ -82,8 +92,48 @@ scripts/evaluate_scale_aware_asd_patchtst.py
     General ASD / LoRA-MoE / ASB ablation runner.
 
 scripts/build_optiver_second_feature_cache.py
+scripts/build_optiver_additional_second_feature_cache.py
 scripts/build_optiver_feature_cache.py
     Cache builders for the local Optiver intraday data.
+```
+
+## Additional Data True-Hour Cut
+
+The original Optiver cache used by most existing reports is based on anonymous
+600-second buckets. The additional Optiver data is cleaner for the scale story:
+`time_id` is sequential and one `time_id` represents one hour. Its order book is
+split into two half-hour files:
+
+```text
+order_book_feature.csv -> seconds_in_bucket 0-1799
+order_book_target.csv  -> seconds_in_bucket 1800-3599
+```
+
+Use this builder to combine those halves into one 3600-second true-hour episode
+per stock/time_id:
+
+```powershell
+.\.conda-fincast\python.exe scripts\build_optiver_additional_second_feature_cache.py
+```
+
+By default it writes:
+
+```text
+data/cache/position_optiver_additional_true_hour_second_feature_cache_10stocks_512h.npz
+```
+
+The builder maps raw additional-data stock ids to dense `stock_0`, `stock_1`,
+... names. The local additional dataset has 10 usable stocks, so the current
+default split is `--train-stocks 0-8` and `--zero-shot-stock 9`. The cache stores `seconds_per_bucket=3600`, so the
+minute scale now aggregates 60 one-minute levels for this cache, while the old
+600-second cache still aggregates 10 one-minute levels.
+
+The active recommended task uses patch preset `balanced_60_30_10`:
+
+```text
+second: context 60, patch 10, stride 5
+minute: context 30, patch 5, stride 2
+hour:   context 10, patch 2, stride 1
 ```
 
 ## Reports For Teammates

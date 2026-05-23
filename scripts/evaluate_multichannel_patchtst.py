@@ -115,15 +115,21 @@ def parse_args() -> argparse.Namespace:
             WORKSPACE_ROOT
             / "data"
             / "cache"
-            / "position_optiver_hf_second_feature_cache_11stocks_512t.npz"
+            / "position_optiver_additional_true_hour_second_feature_cache_10stocks_512h.npz"
         ),
     )
-    parser.add_argument("--output-dir", default=str(WORKSPACE_ROOT / "outputs" / "multichannel_patchtst"))
-    parser.add_argument("--report-path", default=str(WORKSPACE_ROOT / "report" / "multichannel_patchtst_experiment.md"))
-    parser.add_argument("--train-stocks", default="0,1,2,3,4,5,6,7,8,9")
-    parser.add_argument("--zero-shot-stock", type=int, default=10)
+    parser.add_argument(
+        "--output-dir",
+        default=str(WORKSPACE_ROOT / "outputs" / "multichannel_patchtst_true_hour_60_30_10"),
+    )
+    parser.add_argument(
+        "--report-path",
+        default=str(WORKSPACE_ROOT / "report" / "multichannel_patchtst_true_hour_60_30_10.md"),
+    )
+    parser.add_argument("--train-stocks", default="0,1,2,3,4,5,6,7,8")
+    parser.add_argument("--zero-shot-stock", type=int, default=9)
     parser.add_argument("--scales", nargs="+", choices=SCALE_ORDER, default=list(SCALE_ORDER))
-    parser.add_argument("--patch-preset", choices=sorted(PATCH_PRESETS), default="short_second")
+    parser.add_argument("--patch-preset", choices=sorted(PATCH_PRESETS), default="balanced_60_30_10")
     parser.add_argument("--d-model", type=int, default=64)
     parser.add_argument("--n-heads", type=int, default=4)
     parser.add_argument("--n-layers", type=int, default=2)
@@ -213,6 +219,10 @@ def build_multichannel_arrays(
     time_ids = np.asarray(arrays["time_ids"], dtype=np.int64)
     seconds = np.asarray(arrays["seconds_in_bucket"], dtype=np.int64)
     feature_names = [str(name) for name in arrays["feature_names"]]
+    if "seconds_per_bucket" in arrays:
+        seconds_per_bucket = int(np.asarray(arrays["seconds_per_bucket"]).reshape(-1)[0])
+    else:
+        seconds_per_bucket = int(seconds.max()) + 1 if len(seconds) else 600
     required = set(PRICE_LEVEL_CHANNELS + STATE_CHANNELS)
     missing_features = sorted(required - set(feature_names))
     if missing_features:
@@ -287,7 +297,11 @@ def build_multichannel_arrays(
                     )
                     add_to_accumulator(accumulators["second"][split_name], built)
                 if "minute" in scales:
-                    minute_rows = aggregate_minute_feature_rows(features[idx], seconds[idx])
+                    minute_rows = aggregate_minute_feature_rows(
+                        features[idx],
+                        seconds[idx],
+                        seconds_per_bucket=seconds_per_bucket,
+                    )
                     built = build_windows_from_feature_rows(
                         minute_rows,
                         feature_names=feature_names,
@@ -303,6 +317,7 @@ def build_multichannel_arrays(
                 "scale": scale,
                 "context_length": int(scale_specs[scale].context_length),
                 "target_horizon_steps": int(TARGET_HORIZON_STEPS[scale]),
+                "seconds_per_bucket": int(seconds_per_bucket),
                 "channel_names": list(MULTICHANNEL_NAMES),
             }
         }
@@ -326,13 +341,19 @@ def add_to_accumulator(
     accumulator.add(*built)
 
 
-def aggregate_minute_feature_rows(rows: np.ndarray, seconds: np.ndarray) -> np.ndarray:
+def aggregate_minute_feature_rows(
+    rows: np.ndarray,
+    seconds: np.ndarray,
+    *,
+    seconds_per_bucket: int = 600,
+) -> np.ndarray:
     rows = np.asarray(rows, dtype=np.float32)
     seconds = np.asarray(seconds, dtype=np.int64)
     minute_rows = []
-    for minute in range(10):
+    n_minutes = int(math.ceil(float(seconds_per_bucket) / 60.0))
+    for minute in range(n_minutes):
         start = minute * 60
-        stop = min((minute + 1) * 60, 600)
+        stop = min((minute + 1) * 60, int(seconds_per_bucket))
         positions = np.flatnonzero((seconds >= start) & (seconds < stop))
         if len(positions):
             minute_rows.append(rows[positions[-1]])

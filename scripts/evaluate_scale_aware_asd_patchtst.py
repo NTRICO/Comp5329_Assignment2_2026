@@ -64,6 +64,11 @@ PATCH_PRESETS = {
         "minute": {"context_length": 8, "patch_length": 4, "patch_stride": 2},
         "hour": {"context_length": 32, "patch_length": 8, "patch_stride": 4},
     },
+    "balanced_60_30_10": {
+        "second": {"context_length": 60, "patch_length": 10, "patch_stride": 5},
+        "minute": {"context_length": 30, "patch_length": 5, "patch_stride": 2},
+        "hour": {"context_length": 10, "patch_length": 2, "patch_stride": 1},
+    },
     "long_context": {
         "second": {"context_length": 256, "patch_length": 32, "patch_stride": 16},
         "minute": {"context_length": 8, "patch_length": 4, "patch_stride": 2},
@@ -71,7 +76,7 @@ PATCH_PRESETS = {
     },
 }
 TARGET_HORIZON_STEPS = {
-    "second": 30,
+    "second": 10,
     "minute": 1,
     "hour": 1,
 }
@@ -143,22 +148,22 @@ TSLANET_TRAINING_REGIMES = (
     "asd_frozen_encoder_train_head",
     "tslanet_joint",
 )
-DEFAULT_ABLATION_PATCH_PRESETS = ("compact", "fincast_adapted", "short_second")
-DEFAULT_ASB_PATCH_PRESETS = ("compact", "short_second")
-DEFAULT_LORA_MOE_PATCH_PRESETS = ("compact", "short_second")
-DEFAULT_ADAPTER_ABLATION_PATCH_PRESETS = ("short_second",)
-DEFAULT_ASD_LORA_MOE_PATCH_PRESETS = ("compact", "short_second")
-DEFAULT_TSLANET_PATCH_PRESETS = ("compact", "short_second")
+DEFAULT_ABLATION_PATCH_PRESETS = ("balanced_60_30_10",)
+DEFAULT_ASB_PATCH_PRESETS = ("balanced_60_30_10",)
+DEFAULT_LORA_MOE_PATCH_PRESETS = ("balanced_60_30_10",)
+DEFAULT_ADAPTER_ABLATION_PATCH_PRESETS = ("balanced_60_30_10",)
+DEFAULT_ASD_LORA_MOE_PATCH_PRESETS = ("balanced_60_30_10",)
+DEFAULT_TSLANET_PATCH_PRESETS = ("balanced_60_30_10",)
 DEFAULT_ASD_INIT_GATES = (-4.0, -3.0, -2.0)
 DEFAULT_ASB_INIT_GATES = (-4.0, -3.0)
 DEFAULT_ASD_LORA_MOE_INIT_GATES = (-4.0, -3.0)
 DEFAULT_LORA_MOE_RANKS = (4, 8)
-TARGETED_ASD_LORA_MOE_PATCH_PRESET = "short_second"
+TARGETED_ASD_LORA_MOE_PATCH_PRESET = "balanced_60_30_10"
 TARGETED_ASD_LORA_MOE_INIT_GATE = -4.0
 TARGETED_ASD_LORA_MOE_RANK = 8
 TARGETED_ASD_LORA_MOE_REGIME = "asd_lora_moe_frozen_base_train_adapters_head"
-TARGETED_ASD_LORA_MOE_OUTPUT_SUBDIR = "round3_robustness_short_second_rank8"
-TARGETED_ADAPTER_OUTPUT_SUBDIR = "targeted_robustness_short_second_rank8"
+TARGETED_ASD_LORA_MOE_OUTPUT_SUBDIR = "round3_robustness_60_30_10_rank8"
+TARGETED_ADAPTER_OUTPUT_SUBDIR = "targeted_robustness_60_30_10_rank8"
 
 
 @dataclass
@@ -200,7 +205,7 @@ def parse_args() -> argparse.Namespace:
             WORKSPACE_ROOT
             / "data"
             / "cache"
-            / "position_optiver_hf_second_feature_cache_11stocks_512t.npz"
+            / "position_optiver_additional_true_hour_second_feature_cache_10stocks_512h.npz"
         ),
     )
     parser.add_argument(
@@ -209,7 +214,7 @@ def parse_args() -> argparse.Namespace:
             WORKSPACE_ROOT
             / "data"
             / "cache"
-            / "position_optiver_hf_second_feature_cache_11stocks_512t.npz"
+            / "position_optiver_additional_true_hour_second_feature_cache_10stocks_512h.npz"
         ),
     )
     parser.add_argument("--output-dir", default=str(WORKSPACE_ROOT / "outputs" / "scale_aware_asd_patchtst"))
@@ -271,8 +276,8 @@ def parse_args() -> argparse.Namespace:
         default=str(WORKSPACE_ROOT / "report" / "tslanet_intraday_baseline.md"),
     )
     parser.add_argument("--full-reference-summary", default=str(WORKSPACE_ROOT / "outputs" / "optiver_spectral_denoise_patchtst_scale_summary.csv"))
-    parser.add_argument("--train-stocks", default="0,1,2,3,4,5,6,7,8,9")
-    parser.add_argument("--zero-shot-stock", type=int, default=10)
+    parser.add_argument("--train-stocks", default="0,1,2,3,4,5,6,7,8")
+    parser.add_argument("--zero-shot-stock", type=int, default=9)
     parser.add_argument("--scales", nargs="+", choices=SCALE_ORDER, default=list(SCALE_ORDER))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
@@ -281,11 +286,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-layers", type=int, default=2)
     parser.add_argument("--d-ff", type=int, default=128)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--patch-preset", choices=sorted(PATCH_PRESETS), default="fincast_adapted")
+    parser.add_argument("--patch-preset", choices=sorted(PATCH_PRESETS), default="balanced_60_30_10")
     for scale in SCALE_ORDER:
         parser.add_argument(f"--{scale}-context-length", type=int, default=None)
         parser.add_argument(f"--{scale}-patch-length", type=int, default=None)
         parser.add_argument(f"--{scale}-patch-stride", type=int, default=None)
+        parser.add_argument(f"--{scale}-target-horizon-steps", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--batch-size", type=int, default=512)
@@ -1317,7 +1323,7 @@ def run_asd_lora_moe_targeted_robustness(
         seed_rows, seed_records = run_selected_ablation_configs(
             target_args,
             preset="full",
-            round_name="round3_short_second_rank8",
+            round_name="round3_60_30_10_rank8",
             patch_preset=TARGETED_ASD_LORA_MOE_PATCH_PRESET,
             configs=dedupe_configs(configs),
             seed=int(seed),
@@ -1327,11 +1333,11 @@ def run_asd_lora_moe_targeted_robustness(
         rows.extend(seed_rows)
         records.extend(seed_records)
 
-    summary = save_summary(rows, target_root / "round3_short_second_rank8_summary.csv")
+    summary = save_summary(rows, target_root / "round3_60_30_10_rank8_summary.csv")
     aggregate = aggregate_robustness(summary)
-    aggregate.to_csv(target_root / "round3_short_second_rank8_aggregate.csv", index=False)
+    aggregate.to_csv(target_root / "round3_60_30_10_rank8_aggregate.csv", index=False)
     diagnostics = diagnostics_frame(records)
-    diagnostics.to_csv(target_root / "short_second_rank8_diagnostics.csv", index=False)
+    diagnostics.to_csv(target_root / "60_30_10_rank8_diagnostics.csv", index=False)
     validate_targeted_robustness_outputs(summary, diagnostics)
 
     existing_full_summary = load_csv_or_empty(output_root / "round2_full_summary.csv")
@@ -1356,7 +1362,7 @@ def run_asd_lora_moe_targeted_robustness(
         "per_scale_oracle": oracle,
         "decision": decision,
     }
-    (target_root / "asd_lora_moe_short_second_rank8_metrics.json").write_text(
+    (target_root / "asd_lora_moe_60_30_10_rank8_metrics.json").write_text(
         json.dumps(to_jsonable(payload), indent=2),
         encoding="utf-8",
     )
@@ -3202,6 +3208,14 @@ def caps_for_preset(args: argparse.Namespace, preset: str) -> dict[str, int]:
     }
 
 
+def target_horizon_steps_for_scale(args: argparse.Namespace, scale: str) -> int:
+    override = getattr(args, f"{scale}_target_horizon_steps", None)
+    value = TARGET_HORIZON_STEPS[scale] if override is None else int(override)
+    if value <= 0:
+        raise ValueError(f"{scale}: target horizon steps must be positive.")
+    return value
+
+
 def load_scale_data(
     args: argparse.Namespace,
     *,
@@ -3219,7 +3233,7 @@ def load_scale_data(
             train_stocks=train_stocks,
             zero_shot_stock=int(args.zero_shot_stock),
             feature_name="wap1_log_return_1s",
-            target_horizon_steps=TARGET_HORIZON_STEPS[scale],
+            target_horizon_steps=target_horizon_steps_for_scale(args, scale),
             context_length=spec.context_length,
             train_fraction=0.8,
             validation_fraction=0.1,
@@ -4480,7 +4494,7 @@ def write_asd_lora_moe_final_decision_report(
     lines.append("# ASD + PatchTST + LoRA-MoE 最终决策报告")
     lines.append("")
     lines.append(
-        "本报告只确认 `short_second + rank=8 + ASD init gate=-4.0` 的多 seed 稳定性；"
+        "本报告只确认 `balanced_60_30_10 + rank=8 + ASD init gate=-4.0` 的多 seed 稳定性；"
         "没有新增 ASB、attention-level LoRA、MoE 层数或 day 数据。"
     )
     lines.append("")
@@ -4520,9 +4534,9 @@ def write_asd_lora_moe_final_decision_report(
     lines.append("")
     lines.append("## 3. Short-Second Robustness")
     lines.append("")
-    lines.append(f"targeted summary: `{target_root / 'round3_short_second_rank8_summary.csv'}`")
+    lines.append(f"targeted summary: `{target_root / 'round3_60_30_10_rank8_summary.csv'}`")
     lines.append("")
-    lines.append(f"targeted aggregate: `{target_root / 'round3_short_second_rank8_aggregate.csv'}`")
+    lines.append(f"targeted aggregate: `{target_root / 'round3_60_30_10_rank8_aggregate.csv'}`")
     lines.append("")
     if short_second_robustness.empty:
         lines.append("targeted robustness 没有可聚合结果。")
@@ -4609,7 +4623,7 @@ def write_asd_lora_moe_final_decision_report(
     lines.append("")
     lines.append("## 6. Diagnostics 解读")
     lines.append("")
-    lines.append(f"diagnostics: `{target_root / 'short_second_rank8_diagnostics.csv'}`")
+    lines.append(f"diagnostics: `{target_root / '60_30_10_rank8_diagnostics.csv'}`")
     lines.append("")
     if diagnostics.empty:
         lines.append("没有 diagnostics。")

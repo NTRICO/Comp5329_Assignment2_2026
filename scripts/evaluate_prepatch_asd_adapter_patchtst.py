@@ -57,18 +57,21 @@ def parse_args() -> argparse.Namespace:
             WORKSPACE_ROOT
             / "data"
             / "cache"
-            / "position_optiver_hf_second_feature_cache_11stocks_512t.npz"
+            / "position_optiver_additional_true_hour_second_feature_cache_10stocks_512h.npz"
         ),
     )
-    parser.add_argument("--output-dir", default=str(WORKSPACE_ROOT / "outputs" / "prepatch_asd_adapter_patchtst"))
+    parser.add_argument(
+        "--output-dir",
+        default=str(WORKSPACE_ROOT / "outputs" / "prepatch_asd_adapter_patchtst_true_hour_60_30_10"),
+    )
     parser.add_argument(
         "--report-path",
-        default=str(WORKSPACE_ROOT / "report" / "prepatch_asd_adapter_patchtst_experiment.md"),
+        default=str(WORKSPACE_ROOT / "report" / "prepatch_asd_adapter_patchtst_true_hour_60_30_10.md"),
     )
-    parser.add_argument("--train-stocks", default="0,1,2,3,4,5,6,7,8,9")
-    parser.add_argument("--zero-shot-stock", type=int, default=10)
+    parser.add_argument("--train-stocks", default="0,1,2,3,4,5,6,7,8")
+    parser.add_argument("--zero-shot-stock", type=int, default=9)
     parser.add_argument("--scales", nargs="+", choices=SCALE_ORDER, default=list(SCALE_ORDER))
-    parser.add_argument("--patch-preset", choices=sorted(PATCH_PRESETS), default="short_second")
+    parser.add_argument("--patch-preset", choices=sorted(PATCH_PRESETS), default="balanced_60_30_10")
     parser.add_argument("--d-model", type=int, default=64)
     parser.add_argument("--n-heads", type=int, default=4)
     parser.add_argument("--n-layers", type=int, default=2)
@@ -103,6 +106,7 @@ def parse_args() -> argparse.Namespace:
         parser.add_argument(f"--{scale}-context-length", type=int, default=None)
         parser.add_argument(f"--{scale}-patch-length", type=int, default=None)
         parser.add_argument(f"--{scale}-patch-stride", type=int, default=None)
+        parser.add_argument(f"--{scale}-target-horizon-steps", type=int, default=None)
     return parser.parse_args()
 
 
