@@ -119,6 +119,27 @@ balanced_60_45_24 + gated pre-ASD + LoRA-MoE
 
 This is still a small capped confirmation, not a final full-data result. The next run should use the same preset with a larger training budget if time allows.
 
+## Joint-Training Check
+
+We also tested whether the current module stack should be trained jointly with the PatchTST backbone instead of freezing the raw PatchTST checkpoint.
+
+Setting:
+
+```text
+raw PatchTST checkpoint
+-> gated pre-ASD + LoRA-MoE + PatchTST + heads
+-> all parameters unfrozen for continued training
+```
+
+Against raw PatchTST on the same `balanced_60_45_24` setup:
+
+| route | second MSE | minute MSE | hour MSE | note |
+| --- | ---: | ---: | ---: | --- |
+| frozen backbone | -0.41% +/- 0.31% | +1.29% +/- 0.07% | +0.31% +/- 0.56% | current default |
+| joint backbone | -0.67% +/- 0.50% | +1.08% +/- 0.55% | +0.71% +/- 1.08% | slightly better hour, weaker second/minute |
+
+Conclusion: joint training is not the new default. It is worth keeping as an hour-oriented exploratory variant, but the more stable three-scale route remains the frozen-backbone adapter/head setup.
+
 ## Output Files
 
 ```text
@@ -126,4 +147,5 @@ outputs/prepatch_asd_adapter_patchtst/gated_pre_asd_true_hour_60_30_10_h10_confi
 outputs/context_sweep_true_hour/B_60_45_24_confirm_10stocks_3seed/
 outputs/context_sweep_true_hour/C_120_58_48_confirm_10stocks_3seed/
 outputs/context_sweep_true_hour/context_sweep_relative_improvement_aggregate.csv
+outputs/joint_training_true_hour/B_60_45_24_frozen_vs_joint_10stocks_3seed/
 ```

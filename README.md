@@ -37,6 +37,13 @@ multi-seed runner:
 .\.conda-fincast\python.exe scripts\evaluate_gated_pre_asd_32stock_multiseed.py
 ```
 
+The same runner also includes
+`gated_pre_return_asd_lora_moe_joint_patchtst`, which loads the raw PatchTST
+checkpoint and then unfreezes ASD, LoRA-MoE, PatchTST, and heads together. A
+focused 3-seed check found this joint route slightly better for hour but weaker
+for second/minute, so it is kept as an exploratory variant rather than the
+default model.
+
 The current true-hour target protocol uses a 60/45/24 context layout and a
 10-second cumulative target for the second scale:
 

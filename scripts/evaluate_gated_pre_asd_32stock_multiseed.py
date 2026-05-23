@@ -41,7 +41,7 @@ from evaluate_scale_aware_asd_patchtst import (  # noqa: E402
 
 
 DEFAULT_TRAIN_STOCKS = ",".join(
-    str(stock) for stock in range(10)
+    str(stock) for stock in range(9)
 )
 
 
@@ -115,6 +115,7 @@ def parse_args() -> argparse.Namespace:
             "post_return_lora_moe_head",
             "post_return_lora_moe_mlp_head",
             "gated_pre_return_asd_lora_moe_patchtst",
+            "gated_pre_return_asd_lora_moe_joint_patchtst",
             "gated_pre_return_asd_lora_moe_mlp_head",
             "scale_specific_gated_pre_asd_moe_patchtst",
         ],
@@ -123,6 +124,7 @@ def parse_args() -> argparse.Namespace:
             "post_return_lora_moe_head",
             "post_return_lora_moe_mlp_head",
             "gated_pre_return_asd_lora_moe_patchtst",
+            "gated_pre_return_asd_lora_moe_joint_patchtst",
             "gated_pre_return_asd_lora_moe_mlp_head",
             "scale_specific_gated_pre_asd_moe_patchtst",
         ],
@@ -384,6 +386,32 @@ def run_seed(args: argparse.Namespace, seed: int, device: torch.device) -> tuple
             device=device,
             output_dir=seed_output_dir,
             extra={**extra, "architecture": "gated_pre_return_asd_lora_moe"},
+            router_balance_weight=args.router_balance_weight,
+        )
+
+    if "gated_pre_return_asd_lora_moe_joint_patchtst" in args.models:
+        gated_pre_lora_joint = build_preprocessed_model(
+            linear_args,
+            scale_specs,
+            input_mode="return",
+            adapter_kind="lora_moe",
+            residual_to_raw=True,
+            final_gate_init=-2.0,
+        ).to(device)
+        load_raw_backbone_checkpoint(gated_pre_lora_joint, raw_checkpoint)
+        for parameter in gated_pre_lora_joint.parameters():
+            parameter.requires_grad = True
+        train_and_record(
+            rows=rows,
+            diag_rows=diag_rows,
+            model=gated_pre_lora_joint,
+            model_name="gated_pre_return_asd_lora_moe_joint_patchtst",
+            scale_data=scale_data,
+            loaders=loaders,
+            args=linear_args,
+            device=device,
+            output_dir=seed_output_dir,
+            extra={**extra, "architecture": "gated_pre_return_asd_lora_moe_joint", "backbone_training": "unfrozen"},
             router_balance_weight=args.router_balance_weight,
         )
 
