@@ -1,7 +1,7 @@
 {
   "name": "multichannel_asd_lora_moe_patchtst_candidate",
   "purpose": "higher-potential 15-channel candidate; not yet the default unified model",
-  "status": "protocol updated to additional-data true-hour 60/30/10; rerun required before comparing with the main model",
+  "status": "protocol updated to additional-data true-hour 60/45/24; rerun required before comparing with the main model",
   "data": {
     "cache": "data/cache/position_optiver_additional_true_hour_second_feature_cache_10stocks_512h.npz",
     "train_stocks": [
@@ -41,7 +41,7 @@
     ],
     "target": "future WAP1 return"
   },
-  "patch_preset": "balanced_60_30_10",
+  "patch_preset": "balanced_60_45_24",
   "scale_specs": {
     "second": {
       "context_length": 60,
@@ -49,14 +49,14 @@
       "patch_stride": 5
     },
     "minute": {
-      "context_length": 30,
-      "patch_length": 5,
-      "patch_stride": 2
+      "context_length": 45,
+      "patch_length": 9,
+      "patch_stride": 4
     },
     "hour": {
-      "context_length": 10,
-      "patch_length": 2,
-      "patch_stride": 1
+      "context_length": 24,
+      "patch_length": 4,
+      "patch_stride": 2
     }
   },
   "backbone": {
@@ -89,6 +89,6 @@
     "seeds": [42, 43, 44]
   },
   "runner": "scripts/evaluate_multichannel_patchtst_multiseed.py",
-  "report": "report/multichannel_asd_lora_moe_true_hour_60_30_10_h10.md",
-  "decision": "Promising challenger under the previous cache; rerun on the true-hour 60/30/10 protocol before making a final comparison."
+  "report": "report/multichannel_asd_lora_moe_true_hour_60_45_24_h10.md",
+  "decision": "Promising challenger under the previous cache; rerun on the true-hour 60/45/24 protocol before making a final comparison."
 }

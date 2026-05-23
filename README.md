@@ -37,13 +37,13 @@ multi-seed runner:
 .\.conda-fincast\python.exe scripts\evaluate_gated_pre_asd_32stock_multiseed.py
 ```
 
-The current true-hour target protocol uses a 60/30/10 context layout and a
+The current true-hour target protocol uses a 60/45/24 context layout and a
 10-second cumulative target for the second scale:
 
 ```text
 second -> context 60 seconds, predict next 10-second cumulative return
-minute -> context 30 minutes, predict next 1-minute return
-hour   -> context 10 true-hour time_ids, predict next true-hour return
+minute -> context 45 minutes, predict next 1-minute return
+hour   -> context 24 true-hour time_ids, predict next true-hour return
 ```
 
 The strongest follow-up candidate is the 15-channel variant:
@@ -79,7 +79,7 @@ src/baselines/scale_aware_asd_patchtst.py
 
 scripts/evaluate_gated_pre_asd_32stock_multiseed.py
     Main multi-seed confirmation for the selected robust model. The current
-    defaults use the additional-data true-hour cache and 60/30/10 context.
+    defaults use the additional-data true-hour cache and 60/45/24 context.
 
 scripts/evaluate_multichannel_patchtst.py
 scripts/evaluate_multichannel_patchtst_multiseed.py
@@ -128,12 +128,12 @@ default split is `--train-stocks 0-8` and `--zero-shot-stock 9`. The cache store
 minute scale now aggregates 60 one-minute levels for this cache, while the old
 600-second cache still aggregates 10 one-minute levels.
 
-The active recommended task uses patch preset `balanced_60_30_10`:
+The active recommended task uses patch preset `balanced_60_45_24`:
 
 ```text
 second: context 60, patch 10, stride 5
-minute: context 30, patch 5, stride 2
-hour:   context 10, patch 2, stride 1
+minute: context 45, patch 9, stride 4
+hour:   context 24, patch 4, stride 2
 ```
 
 ## Reports For Teammates
@@ -142,6 +142,8 @@ Start here:
 
 ```text
 report/TEAMMATE_HANDOFF.md
+report/data_handoff_for_teammate.md
+report/context_sweep_true_hour_summary.md
 report/README.md
 ```
 

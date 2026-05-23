@@ -61,16 +61,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir",
-        default=str(WORKSPACE_ROOT / "outputs" / "multichannel_asd_lora_moe_true_hour_60_30_10_h10"),
+        default=str(WORKSPACE_ROOT / "outputs" / "multichannel_asd_lora_moe_true_hour_60_45_24_h10"),
     )
     parser.add_argument(
         "--report-path",
-        default=str(WORKSPACE_ROOT / "report" / "multichannel_asd_lora_moe_true_hour_60_30_10_h10.md"),
+        default=str(WORKSPACE_ROOT / "report" / "multichannel_asd_lora_moe_true_hour_60_45_24_h10.md"),
     )
     parser.add_argument("--train-stocks", default=DEFAULT_TRAIN_STOCKS)
     parser.add_argument("--zero-shot-stock", type=int, default=9)
     parser.add_argument("--scales", nargs="+", choices=SCALE_ORDER, default=list(SCALE_ORDER))
-    parser.add_argument("--patch-preset", choices=sorted(PATCH_PRESETS), default="balanced_60_30_10")
+    parser.add_argument("--patch-preset", choices=sorted(PATCH_PRESETS), default="balanced_60_45_24")
     parser.add_argument("--d-model", type=int, default=64)
     parser.add_argument("--n-heads", type=int, default=4)
     parser.add_argument("--n-layers", type=int, default=2)

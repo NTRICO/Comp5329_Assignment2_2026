@@ -26,16 +26,16 @@ save as existing-runner-compatible npz cache
 | scale | 当前切法 |
 | --- | --- |
 | second | 同一个真实小时内的 60 个 1-second return，默认预测未来 10 秒累计 return |
-| minute | 同一个真实小时内聚合 60 个 1-minute WAP level，使用 30 个 minute return 预测下一分钟 |
-| hour | 按 sequential `time_id` 的真实小时级 WAP level，使用 10 个 hour return 预测下一小时 |
+| minute | 同一个真实小时内聚合 60 个 1-minute WAP level，使用 45 个 minute return 预测下一分钟 |
+| hour | 按 sequential `time_id` 的真实小时级 WAP level，使用 24 个 hour return 预测下一小时 |
 
-当前推荐 patch preset 是 `balanced_60_30_10`：
+当前推荐 patch preset 是 `balanced_60_45_24`：
 
 | scale | context | patch | stride |
 | --- | ---: | ---: | ---: |
 | second | 60 | 10 | 5 |
-| minute | 30 | 5 | 2 |
-| hour | 10 | 2 | 1 |
+| minute | 45 | 9 | 4 |
+| hour | 24 | 4 | 2 |
 
 ## 使用命令
 

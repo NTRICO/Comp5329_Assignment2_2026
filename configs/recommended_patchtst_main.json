@@ -1,7 +1,7 @@
 {
   "name": "gated_pre_return_asd_lora_moe_patchtst",
   "purpose": "robust unified second/minute/hour PatchTST optimization model",
-  "status": "protocol updated to additional-data true-hour 60/30/10; rerun required before claiming final results",
+  "status": "protocol updated to additional-data true-hour 60/45/24 after context sweep; use as current main candidate",
   "data": {
     "cache": "data/cache/position_optiver_additional_true_hour_second_feature_cache_10stocks_512h.npz",
     "train_stocks": [
@@ -25,7 +25,7 @@
       "hour": "next 1 true-hour time_id-step WAP1 log return"
     }
   },
-  "patch_preset": "balanced_60_30_10",
+  "patch_preset": "balanced_60_45_24",
   "scale_specs": {
     "second": {
       "context_length": 60,
@@ -33,14 +33,14 @@
       "patch_stride": 5
     },
     "minute": {
-      "context_length": 30,
-      "patch_length": 5,
-      "patch_stride": 2
+      "context_length": 45,
+      "patch_length": 9,
+      "patch_stride": 4
     },
     "hour": {
-      "context_length": 10,
-      "patch_length": 2,
-      "patch_stride": 1
+      "context_length": 24,
+      "patch_length": 4,
+      "patch_stride": 2
     }
   },
   "backbone": {
@@ -74,5 +74,5 @@
     "seeds": [42, 43, 44]
   },
   "runner": "scripts/evaluate_gated_pre_asd_32stock_multiseed.py",
-  "report": "report/gated_pre_asd_true_hour_60_30_10_h10.md"
+  "report": "report/gated_pre_asd_true_hour_60_45_24_h10.md"
 }

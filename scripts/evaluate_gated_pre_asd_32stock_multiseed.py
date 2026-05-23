@@ -64,18 +64,18 @@ def parse_args() -> argparse.Namespace:
             WORKSPACE_ROOT
             / "outputs"
             / "prepatch_asd_adapter_patchtst"
-            / "gated_pre_asd_true_hour_60_30_10_h10"
+            / "gated_pre_asd_true_hour_60_45_24_h10"
         ),
     )
     parser.add_argument(
         "--report-path",
-        default=str(WORKSPACE_ROOT / "report" / "gated_pre_asd_true_hour_60_30_10_h10.md"),
+        default=str(WORKSPACE_ROOT / "report" / "gated_pre_asd_true_hour_60_45_24_h10.md"),
     )
     parser.add_argument("--train-stocks", default=DEFAULT_TRAIN_STOCKS)
     parser.add_argument("--zero-shot-stock", type=int, default=9)
     parser.add_argument("--seeds", nargs="+", type=int, default=[42, 43, 44])
     parser.add_argument("--scales", nargs="+", choices=SCALE_ORDER, default=list(SCALE_ORDER))
-    parser.add_argument("--patch-preset", choices=sorted(PATCH_PRESETS), default="balanced_60_30_10")
+    parser.add_argument("--patch-preset", choices=sorted(PATCH_PRESETS), default="balanced_60_45_24")
     parser.add_argument("--d-model", type=int, default=64)
     parser.add_argument("--n-heads", type=int, default=4)
     parser.add_argument("--n-layers", type=int, default=2)
@@ -197,7 +197,7 @@ def write_report(
     args: argparse.Namespace,
 ) -> None:
     lines: list[str] = []
-    lines.append("# Gated Pre-ASD True-Hour 60/30/10 Multi-Seed Confirmation")
+    lines.append("# Gated Pre-ASD True-Hour Multi-Seed Confirmation")
     lines.append("")
     lines.append(
         "This run checks whether `gated_pre_return_asd_lora_moe_patchtst` remains useful "

@@ -22,7 +22,7 @@ return window
 
 - config: `configs/recommended_patchtst_main.json`
 - runner: `scripts/evaluate_gated_pre_asd_32stock_multiseed.py`
-- report: `report/gated_pre_asd_true_hour_60_30_10_h10.md`
+- report: `report/gated_pre_asd_true_hour_60_45_24_h10.md`
 
 注意：这里的 LoRA-MoE 是 pre-PatchTST 的 sequence adapter，不是早期讨论里简写的 post-PatchTST token adapter。这样做是为了先让输入序列做金融域和尺度适配，再交给共享 PatchTST 学 temporal pattern。
 
@@ -50,11 +50,11 @@ flowchart TD
 | cache | `data/cache/position_optiver_additional_true_hour_second_feature_cache_10stocks_512h.npz` |
 | train stocks | 9 dense stocks: `0-8` |
 | zero-shot stock | `9` |
-| patch preset | `balanced_60_30_10` |
+| patch preset | `balanced_60_45_24` |
 | target horizons | second: next `10` seconds; minute: next `1` minute; hour: next `1` true-hour step |
 | second | context `60`, patch `10`, stride `5` |
-| minute | context `30`, patch `5`, stride `2` |
-| hour | context `10`, patch `2`, stride `1` |
+| minute | context `45`, patch `9`, stride `4` |
+| hour | context `24`, patch `4`, stride `2` |
 | PatchTST | `d_model=64`, `n_heads=4`, `n_layers=2`, `d_ff=128`, `dropout=0.1` |
 | LoRA-MoE | rank `8`, alpha `16`, experts `4`, top-k `2` |
 | ASD | init gate `-4.0` |
@@ -82,9 +82,9 @@ flowchart TD
 ```
 
 The wrapper defaults to the additional-data true-hour cache, patch preset
-`balanced_60_30_10`, and `--second-target-horizon-steps 10`. Older reports used
+`balanced_60_45_24`, and `--second-target-horizon-steps 10`. Older reports used
 the 600-second bucket cache and/or a 30-second cumulative second-level target,
-so rerun the wrapper before treating the 60/30/10 protocol as final evidence.
+so rerun the wrapper before treating the true-hour protocol as final evidence.
 
 多通道候选复现：
 
