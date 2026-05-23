@@ -1,0 +1,110 @@
+{
+  "name": "multichannel_asd_lora_moe_patchtst_candidate",
+  "purpose": "higher-potential 15-channel candidate; not yet the default unified model",
+  "data": {
+    "cache": "data/cache/position_optiver_hf_second_feature_cache_32stocks_512t.npz",
+    "train_stocks": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33
+    ],
+    "zero_shot_stock": 34,
+    "scales": ["second", "minute", "hour"],
+    "channels": [
+      "wap1_log_return",
+      "wap2_log_return",
+      "mid1_log_return",
+      "mid2_log_return",
+      "rel_spread1",
+      "rel_spread2",
+      "imbalance1",
+      "imbalance2",
+      "log_total_size1",
+      "log_total_size2",
+      "total_imbalance",
+      "updates_in_second",
+      "is_observed_update",
+      "seconds_since_update",
+      "second_frac"
+    ],
+    "target": "future WAP1 return"
+  },
+  "patch_preset": "short_second",
+  "scale_specs": {
+    "second": {
+      "context_length": 64,
+      "patch_length": 8,
+      "patch_stride": 4
+    },
+    "minute": {
+      "context_length": 8,
+      "patch_length": 4,
+      "patch_stride": 2
+    },
+    "hour": {
+      "context_length": 32,
+      "patch_length": 8,
+      "patch_stride": 4
+    }
+  },
+  "backbone": {
+    "d_model": 64,
+    "n_heads": 4,
+    "n_layers": 2,
+    "d_ff": 128,
+    "dropout": 0.1,
+    "patch_embedding": "scale-specific",
+    "encoder": "shared PatchTST",
+    "head": "scale-specific linear"
+  },
+  "adaptation": {
+    "input_asd": true,
+    "lora_moe_mode": "post PatchTST token adapter",
+    "lora_rank": 8,
+    "lora_alpha": 16.0,
+    "n_experts": 4,
+    "top_k": 2,
+    "router_balance_weight": 0.001
+  },
+  "training": {
+    "stage_1": "train multichannel raw PatchTST baseline",
+    "stage_2": "load raw checkpoint, freeze base, train ASD + LoRA-MoE + heads",
+    "epochs": 5,
+    "balanced_steps_per_epoch": 50,
+    "batch_size": 512,
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001,
+    "seeds": [42, 43, 44]
+  },
+  "runner": "scripts/evaluate_multichannel_patchtst_multiseed.py",
+  "report": "report/multichannel_asd_lora_moe_32stock_multiseed.md",
+  "decision": "Promising challenger: better second/hour in current run, but minute is slightly worse and seed variance is still higher than the robust main model."
+}

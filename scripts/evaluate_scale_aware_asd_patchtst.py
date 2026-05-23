@@ -3308,6 +3308,8 @@ def build_model(
         lora_moe_n_experts=args.lora_moe_n_experts,
         lora_moe_top_k=args.lora_moe_top_k,
         lora_moe_dropout=args.lora_moe_dropout,
+        head_type=getattr(args, "head_type", "linear"),
+        head_hidden_dim=getattr(args, "head_hidden_dim", 128),
     )
     if model_name == "raw_patchtst":
         return RawMultiScalePatchTST(backbone)

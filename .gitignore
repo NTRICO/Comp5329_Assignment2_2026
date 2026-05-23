@@ -27,6 +27,11 @@ data/fincast_inputs/
 data/high-frequency/
 data/raw/FinCast-Paper-test/
 outputs/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.npz
 
 # Local logs and temporary files
 *.log

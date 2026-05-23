@@ -436,6 +436,33 @@ class ScaleAwareLoRAAdapterMoE(nn.Module):
         )
         nn.init.zeros_(self.scale_router.weight)
 
+    def routing_logits(self, h: torch.Tensor, scale_emb: torch.Tensor) -> torch.Tensor:
+        if h.ndim != 3:
+            raise ValueError(f"h must be [B,N,D], got {tuple(h.shape)}")
+        batch_size, token_count, d_model = h.shape
+        if d_model != self.d_model:
+            raise ValueError(f"d_model must be {self.d_model}, got {d_model}")
+        if scale_emb.shape != (batch_size, d_model):
+            raise ValueError(f"scale_emb must be [{batch_size},{d_model}], got {tuple(scale_emb.shape)}")
+        scale_tokens = scale_emb[:, None, :].expand(batch_size, token_count, d_model)
+        scale_logits = self.scale_router(scale_emb)[:, None, :]
+        return self.router(torch.cat([h, scale_tokens], dim=-1)) + scale_logits
+
+    def routing_weights(
+        self,
+        h: torch.Tensor,
+        scale_emb: torch.Tensor,
+        *,
+        sparse: bool = True,
+    ) -> torch.Tensor:
+        logits = self.routing_logits(h, scale_emb)
+        if sparse and self.top_k < self.n_experts:
+            top_values, top_indices = torch.topk(logits, self.top_k, dim=-1)
+            masked_logits = torch.full_like(logits, float("-inf"))
+            masked_logits.scatter_(-1, top_indices, top_values)
+            return torch.softmax(masked_logits, dim=-1)
+        return torch.softmax(logits, dim=-1)
+
     def forward(
         self,
         h: torch.Tensor,
@@ -451,16 +478,7 @@ class ScaleAwareLoRAAdapterMoE(nn.Module):
         if scale_emb.shape != (batch_size, d_model):
             raise ValueError(f"scale_emb must be [{batch_size},{d_model}], got {tuple(scale_emb.shape)}")
 
-        scale_tokens = scale_emb[:, None, :].expand(batch_size, token_count, d_model)
-        scale_logits = self.scale_router(scale_emb)[:, None, :]
-        logits = self.router(torch.cat([h, scale_tokens], dim=-1)) + scale_logits
-        if self.top_k < self.n_experts:
-            top_values, top_indices = torch.topk(logits, self.top_k, dim=-1)
-            masked_logits = torch.full_like(logits, float("-inf"))
-            masked_logits.scatter_(-1, top_indices, top_values)
-            weights = torch.softmax(masked_logits, dim=-1)
-        else:
-            weights = torch.softmax(logits, dim=-1)
+        weights = self.routing_weights(h, scale_emb, sparse=True)
 
         expert_outputs = torch.stack([expert(h) for expert in self.experts], dim=-2)
         update = (weights.unsqueeze(-1) * expert_outputs).sum(dim=-2)
@@ -662,6 +680,37 @@ class TSLANetMultiScaleForecaster(nn.Module):
         return y
 
 
+class ForecastHead(nn.Module):
+    """Scale-specific forecast head over flattened PatchTST tokens."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        prediction_length: int,
+        *,
+        dropout: float = 0.1,
+        head_type: str = "linear",
+        hidden_dim: int = 128,
+    ) -> None:
+        super().__init__()
+        self.flatten = nn.Flatten(start_dim=-2)
+        self.dropout = nn.Dropout(dropout)
+        if head_type == "linear":
+            self.net = nn.Linear(input_dim, prediction_length)
+        elif head_type == "mlp":
+            self.net = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, prediction_length),
+            )
+        else:
+            raise ValueError("head_type must be 'linear' or 'mlp'.")
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        return self.net(self.dropout(self.flatten(tokens)))
+
+
 class MultiScalePatchTST(nn.Module):
     """PatchTST-style forecaster with scale-specific patching and shared encoder."""
 
@@ -684,14 +733,18 @@ class MultiScalePatchTST(nn.Module):
         lora_moe_top_k: int = 2,
         lora_moe_dropout: float = 0.1,
         target_mode: str = "per_channel",
+        head_type: str = "linear",
+        head_hidden_dim: int = 128,
     ) -> None:
         super().__init__()
-        if encoder_spectral_mode not in {"none", "last1"}:
-            raise ValueError("encoder_spectral_mode must be 'none' or 'last1'.")
-        if lora_moe_mode not in {"none", "last1", "lora_only", "mlp_moe"}:
-            raise ValueError("lora_moe_mode must be 'none', 'last1', 'lora_only', or 'mlp_moe'.")
+        if encoder_spectral_mode not in {"none", "last1", "after1"}:
+            raise ValueError("encoder_spectral_mode must be 'none', 'last1', or 'after1'.")
+        if lora_moe_mode not in {"none", "last1", "after1", "lora_only", "mlp_moe"}:
+            raise ValueError("lora_moe_mode must be 'none', 'last1', 'after1', 'lora_only', or 'mlp_moe'.")
         if target_mode not in {"per_channel", "all_channels"}:
             raise ValueError("target_mode must be 'per_channel' or 'all_channels'.")
+        if head_type not in {"linear", "mlp"}:
+            raise ValueError("head_type must be 'linear' or 'mlp'.")
         if not scale_specs:
             raise ValueError("scale_specs must not be empty.")
         for spec in scale_specs.values():
@@ -708,6 +761,7 @@ class MultiScalePatchTST(nn.Module):
         self.encoder_spectral_mode = encoder_spectral_mode
         self.lora_moe_mode = lora_moe_mode
         self.target_mode = target_mode
+        self.head_type = head_type
         self.scale_embedding = LogScaleEmbedding(d_model)
         self.patch_projection = nn.ModuleDict(
             {name: nn.Linear(spec.patch_length, d_model) for name, spec in self.scale_specs.items()}
@@ -731,11 +785,11 @@ class MultiScalePatchTST(nn.Module):
         self.layers = nn.ModuleList(PatchTSTEncoderLayer(encoder_config) for _ in range(n_layers))
         self.encoder_spectral = (
             AdaptiveSpectralEncoderBlock(d_model, self.max_patch_count, init_gate=encoder_spectral_init_gate)
-            if encoder_spectral_mode == "last1"
+            if encoder_spectral_mode != "none"
             else None
         )
         self.lora_moe = None
-        if lora_moe_mode == "last1":
+        if lora_moe_mode in {"last1", "after1"}:
             self.lora_moe = ScaleAwareLoRAAdapterMoE(
                 d_model,
                 n_experts=lora_moe_n_experts,
@@ -763,10 +817,12 @@ class MultiScalePatchTST(nn.Module):
         head_input_multiplier = self.input_channels if target_mode == "all_channels" else 1
         self.heads = nn.ModuleDict(
             {
-                name: nn.Sequential(
-                    nn.Flatten(start_dim=-2),
-                    nn.Dropout(dropout),
-                    nn.Linear(d_model * spec.patch_count * head_input_multiplier, spec.prediction_length),
+                name: ForecastHead(
+                    d_model * spec.patch_count * head_input_multiplier,
+                    spec.prediction_length,
+                    dropout=dropout,
+                    head_type=head_type,
+                    hidden_dim=head_hidden_dim,
                 )
                 for name, spec in self.scale_specs.items()
             }
@@ -778,6 +834,51 @@ class MultiScalePatchTST(nn.Module):
         delta = torch.full((batch_size,), float(spec.delta_seconds), device=device)
         scale_id = torch.full((batch_size,), int(spec.scale_id), device=device, dtype=torch.long)
         return self.scale_embedding(delta, scale_id)
+
+    def adapter_input_tokens(
+        self,
+        past_values: torch.Tensor,
+        scale_name: str,
+        *,
+        include_encoder_spectral: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor, int, int, ScaleSpec]:
+        if scale_name not in self.scale_specs:
+            raise ValueError(f"unknown scale {scale_name!r}; expected {sorted(self.scale_specs)}")
+        if past_values.ndim != 3:
+            raise ValueError(f"past_values must be [B,L,C], got {tuple(past_values.shape)}")
+        spec = self.scale_specs[scale_name]
+        batch_size, context_length, channels = past_values.shape
+        if context_length != spec.context_length:
+            raise ValueError(f"{scale_name}: context_length must be {spec.context_length}, got {context_length}")
+        if channels != self.input_channels:
+            raise ValueError(f"input_channels must be {self.input_channels}, got {channels}")
+
+        x = past_values.transpose(1, 2)
+        x = x.unfold(dimension=-1, size=spec.patch_length, step=spec.patch_stride)
+        x = x.reshape(batch_size * channels, spec.patch_count, spec.patch_length)
+        x = self.patch_projection[scale_name](x)
+        scale_emb = self.scale_embedding_for(scale_name, batch_size, past_values.device)
+        scale_emb = scale_emb.repeat_interleave(channels, dim=0)
+        x = x + self.position_embedding[:, : spec.patch_count, :] + scale_emb[:, None, :]
+        x = self.input_dropout(x)
+        for layer_idx, layer in enumerate(self.layers):
+            x = layer(x)
+            if (
+                include_encoder_spectral
+                and self.encoder_spectral is not None
+                and self.encoder_spectral_mode == "after1"
+                and layer_idx == 0
+            ):
+                x = self.encoder_spectral(x, scale_emb)
+            if self.lora_moe is not None and self.lora_moe_mode == "after1" and layer_idx == 0:
+                x = self.lora_moe(x, scale_emb)
+        if (
+            include_encoder_spectral
+            and self.encoder_spectral is not None
+            and self.encoder_spectral_mode == "last1"
+        ):
+            x = self.encoder_spectral(x, scale_emb)
+        return x, scale_emb, batch_size, channels, spec
 
     def forward(
         self,
@@ -805,12 +906,29 @@ class MultiScalePatchTST(nn.Module):
         scale_emb = scale_emb.repeat_interleave(channels, dim=0)
         x = x + self.position_embedding[:, : spec.patch_count, :] + scale_emb[:, None, :]
         x = self.input_dropout(x)
-        for layer in self.layers:
-            x = layer(x)
         diagnostics: dict[str, torch.Tensor] = {}
-        if self.encoder_spectral is not None:
-            x, diagnostics = self.encoder_spectral(x, scale_emb, return_diagnostics=True)
-        if self.lora_moe is not None:
+        for layer_idx, layer in enumerate(self.layers):
+            x = layer(x)
+            if self.encoder_spectral is not None and self.encoder_spectral_mode == "after1" and layer_idx == 0:
+                if return_diagnostics:
+                    x, spectral_diagnostics = self.encoder_spectral(x, scale_emb, return_diagnostics=True)
+                    diagnostics.update(spectral_diagnostics)
+                else:
+                    x = self.encoder_spectral(x, scale_emb)
+            if self.lora_moe is not None and self.lora_moe_mode == "after1" and layer_idx == 0:
+                if return_diagnostics:
+                    x, moe_diagnostics = self.lora_moe(x, scale_emb, return_diagnostics=True)
+                    diagnostics.update({f"mid_moe_{key}": value for key, value in moe_diagnostics.items()})
+                    diagnostics.update(moe_diagnostics)
+                else:
+                    x = self.lora_moe(x, scale_emb)
+        if self.encoder_spectral is not None and self.encoder_spectral_mode == "last1":
+            if return_diagnostics:
+                x, spectral_diagnostics = self.encoder_spectral(x, scale_emb, return_diagnostics=True)
+                diagnostics.update(spectral_diagnostics)
+            else:
+                x = self.encoder_spectral(x, scale_emb)
+        if self.lora_moe is not None and self.lora_moe_mode != "after1":
             x, moe_diagnostics = self.lora_moe(x, scale_emb, return_diagnostics=True)
             diagnostics.update(moe_diagnostics)
         x = self.norm(x)
@@ -845,6 +963,470 @@ class RawMultiScalePatchTST(nn.Module):
             return y
         zero = torch.zeros((), dtype=past_values.dtype, device=past_values.device)
         return y, {"gate_mean": zero, "tau_mean": zero, "mean_abs_delta": zero}
+
+
+class ScaleSpecificPatchTST(nn.Module):
+    """Use an independent PatchTST backbone for each intraday scale."""
+
+    def __init__(
+        self,
+        scale_specs: dict[str, ScaleSpec],
+        *,
+        input_channels: int = 1,
+        d_model: int = 64,
+        n_heads: int = 4,
+        n_layers: int = 2,
+        d_ff: int = 128,
+        dropout: float = 0.1,
+        head_type: str = "linear",
+        head_hidden_dim: int = 128,
+    ) -> None:
+        super().__init__()
+        self.scale_specs = dict(scale_specs)
+        self.backbones = nn.ModuleDict(
+            {
+                name: MultiScalePatchTST(
+                    {name: spec},
+                    input_channels=input_channels,
+                    d_model=d_model,
+                    n_heads=n_heads,
+                    n_layers=n_layers,
+                    d_ff=d_ff,
+                    dropout=dropout,
+                    encoder_spectral_mode="none",
+                    lora_moe_mode="none",
+                    head_type=head_type,
+                    head_hidden_dim=head_hidden_dim,
+                )
+                for name, spec in self.scale_specs.items()
+            }
+        )
+
+    def forward(
+        self,
+        past_values: torch.Tensor,
+        scale_name: str,
+        *,
+        return_diagnostics: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if scale_name not in self.backbones:
+            raise ValueError(f"unknown scale {scale_name!r}; expected {sorted(self.backbones)}")
+        out = self.backbones[scale_name](past_values, scale_name, return_diagnostics=return_diagnostics)
+        if not return_diagnostics:
+            return out
+        if isinstance(out, tuple):
+            return out
+        zero = torch.zeros((), dtype=past_values.dtype, device=past_values.device)
+        return out, {"gate_mean": zero, "tau_mean": zero, "mean_abs_delta": zero}
+
+
+class PaddedFrequencyRouterScaleSpecificASDPatchTST(nn.Module):
+    """Pad variable scale windows, route by FFT embedding, then use scale-specific PatchTST backbones."""
+
+    def __init__(
+        self,
+        scale_specs: dict[str, ScaleSpec],
+        *,
+        input_channels: int = 1,
+        d_model: int = 64,
+        n_heads: int = 4,
+        n_layers: int = 2,
+        d_ff: int = 128,
+        dropout: float = 0.1,
+        init_gate: float = -4.0,
+        top_k: int = 2,
+        scale_prior_strength: float = 1.0,
+        head_type: str = "linear",
+        head_hidden_dim: int = 128,
+    ) -> None:
+        super().__init__()
+        if not scale_specs:
+            raise ValueError("scale_specs must not be empty.")
+        if top_k <= 0:
+            raise ValueError("top_k must be positive.")
+        self.scale_specs = dict(scale_specs)
+        self.scale_names = list(self.scale_specs)
+        self.input_channels = int(input_channels)
+        self.d_model = int(d_model)
+        self.max_context_length = max(spec.context_length for spec in self.scale_specs.values())
+        self.freq_count = self.max_context_length // 2 + 1
+        self.top_k = min(int(top_k), len(self.scale_names))
+
+        self.scale_embedding = LogScaleEmbedding(d_model)
+        self.frequency_embedding = nn.Sequential(
+            nn.LayerNorm(self.freq_count),
+            nn.Linear(self.freq_count, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+        self.router = nn.Sequential(
+            nn.LayerNorm(d_model * 2),
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, len(self.scale_names)),
+        )
+        self.scale_router_prior = nn.Embedding(3, len(self.scale_names))
+        nn.init.zeros_(self.scale_router_prior.weight)
+        with torch.no_grad():
+            for expert_idx, spec in enumerate(self.scale_specs.values()):
+                if spec.scale_id < self.scale_router_prior.weight.shape[0]:
+                    self.scale_router_prior.weight[spec.scale_id, expert_idx] = float(scale_prior_strength)
+
+        self.asd_experts = nn.ModuleDict(
+            {
+                name: AdaptiveSpectralDenoising(d_model, init_gate=init_gate)
+                for name in self.scale_names
+            }
+        )
+        self.backbones = nn.ModuleDict(
+            {
+                name: MultiScalePatchTST(
+                    {name: spec},
+                    input_channels=input_channels,
+                    d_model=d_model,
+                    n_heads=n_heads,
+                    n_layers=n_layers,
+                    d_ff=d_ff,
+                    dropout=dropout,
+                    encoder_spectral_mode="none",
+                    lora_moe_mode="none",
+                    head_type=head_type,
+                    head_hidden_dim=head_hidden_dim,
+                )
+                for name, spec in self.scale_specs.items()
+            }
+        )
+
+    def scale_embedding_for(self, scale_name: str, batch_size: int, device: torch.device) -> torch.Tensor:
+        spec = self.scale_specs[scale_name]
+        delta = torch.full((batch_size,), float(spec.delta_seconds), device=device)
+        scale_id = torch.full((batch_size,), int(spec.scale_id), device=device, dtype=torch.long)
+        return self.scale_embedding(delta, scale_id)
+
+    def router_weights(
+        self,
+        past_values: torch.Tensor,
+        scale_name: str,
+        scale_emb: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        spec = self.scale_specs[scale_name]
+        length = past_values.shape[1]
+        if length > self.max_context_length:
+            raise ValueError(f"{scale_name}: length {length} exceeds max padded length {self.max_context_length}.")
+        padded = F.pad(past_values, (0, 0, 0, self.max_context_length - length))
+        spectrum = torch.fft.rfft(padded.transpose(1, 2), dim=-1)
+        magnitude = torch.log1p(torch.abs(spectrum).mean(dim=1))
+        freq_emb = self.frequency_embedding(magnitude)
+        router_input = torch.cat([freq_emb, scale_emb], dim=-1)
+        scale_id = torch.full(
+            (past_values.shape[0],),
+            int(spec.scale_id),
+            dtype=torch.long,
+            device=past_values.device,
+        )
+        logits = self.router(router_input) + self.scale_router_prior(scale_id)
+        if self.top_k < logits.shape[-1]:
+            top_values, top_indices = torch.topk(logits, self.top_k, dim=-1)
+            masked = torch.full_like(logits, float("-inf"))
+            masked.scatter_(-1, top_indices, top_values)
+            weights = torch.softmax(masked, dim=-1)
+        else:
+            weights = torch.softmax(logits, dim=-1)
+        return weights, logits, freq_emb
+
+    def forward(
+        self,
+        past_values: torch.Tensor,
+        scale_name: str,
+        *,
+        return_diagnostics: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if scale_name not in self.scale_specs:
+            raise ValueError(f"unknown scale {scale_name!r}; expected {sorted(self.scale_specs)}")
+        if past_values.ndim != 3:
+            raise ValueError(f"past_values must be [B,L,C], got {tuple(past_values.shape)}")
+        spec = self.scale_specs[scale_name]
+        if past_values.shape[1] != spec.context_length:
+            raise ValueError(f"{scale_name}: input length must be {spec.context_length}, got {past_values.shape[1]}")
+        if past_values.shape[2] != self.input_channels:
+            raise ValueError(f"input_channels must be {self.input_channels}, got {past_values.shape[2]}")
+
+        scale_emb = self.scale_embedding_for(scale_name, past_values.shape[0], past_values.device)
+        weights, _, freq_emb = self.router_weights(past_values, scale_name, scale_emb)
+        expert_outputs: list[torch.Tensor] = []
+        expert_gate_means: list[torch.Tensor] = []
+        expert_tau_means: list[torch.Tensor] = []
+        for expert_name in self.scale_names:
+            clean, asd_diagnostics = self.asd_experts[expert_name](
+                past_values,
+                scale_emb,
+                return_diagnostics=True,
+            )
+            expert_outputs.append(clean)
+            expert_gate_means.append(asd_diagnostics["gate_mean"])
+            expert_tau_means.append(asd_diagnostics["tau_mean"])
+        stacked = torch.stack(expert_outputs, dim=-1)
+        routed = (stacked * weights[:, None, None, :]).sum(dim=-1)
+        out = self.backbones[scale_name](routed, scale_name, return_diagnostics=return_diagnostics)
+        if not return_diagnostics:
+            return out
+        if isinstance(out, tuple):
+            y, backbone_diagnostics = out
+        else:
+            y, backbone_diagnostics = out, {}
+
+        avg_prob = weights.mean(dim=0)
+        uniform = torch.full_like(avg_prob, 1.0 / len(self.scale_names))
+        entropy = -(weights * torch.log(weights.clamp_min(1e-8))).sum(dim=-1).mean()
+        gate_stack = torch.stack(expert_gate_means)
+        tau_stack = torch.stack(expert_tau_means)
+        diagnostics: dict[str, torch.Tensor] = {
+            "router_entropy": entropy,
+            "router_balance_loss": F.mse_loss(avg_prob, uniform),
+            "asd_router_entropy": entropy,
+            "asd_router_balance_loss": F.mse_loss(avg_prob, uniform),
+            "frequency_embedding_norm": torch.mean(torch.linalg.vector_norm(freq_emb, dim=-1)),
+            "mean_abs_delta": torch.mean(torch.abs(routed - past_values)),
+            "asd_gate_mean": torch.sum(avg_prob * gate_stack),
+            "asd_tau_mean": torch.sum(avg_prob * tau_stack),
+            "padded_context_length": torch.tensor(
+                float(self.max_context_length),
+                dtype=past_values.dtype,
+                device=past_values.device,
+            ),
+        }
+        for expert_idx, expert_name in enumerate(self.scale_names):
+            diagnostics[f"expert_prob_{expert_idx}"] = avg_prob[expert_idx]
+            diagnostics[f"expert_{expert_name}_prob"] = avg_prob[expert_idx]
+            diagnostics[f"expert_{expert_name}_gate_mean"] = expert_gate_means[expert_idx]
+        diagnostics.update(backbone_diagnostics)
+        diagnostics.update({f"backbone_{key}": value for key, value in backbone_diagnostics.items()})
+        return y, diagnostics
+
+
+class PaddedFrequencyRouterSharedASDPatchTST(nn.Module):
+    """Route padded sequences through ASD experts, crop, then use one shared PatchTST backbone."""
+
+    def __init__(
+        self,
+        scale_specs: dict[str, ScaleSpec],
+        *,
+        input_channels: int = 1,
+        d_model: int = 64,
+        n_heads: int = 4,
+        n_layers: int = 2,
+        d_ff: int = 128,
+        dropout: float = 0.1,
+        init_gate: float = -4.0,
+        top_k: int = 2,
+        scale_prior_strength: float = 1.0,
+        include_identity_expert: bool = True,
+        backbone_lora_moe_mode: str = "none",
+        lora_moe_rank: int = 4,
+        lora_moe_alpha: float = 16.0,
+        lora_moe_n_experts: int = 4,
+        lora_moe_top_k: int = 2,
+        lora_moe_dropout: float = 0.1,
+        head_type: str = "linear",
+        head_hidden_dim: int = 128,
+    ) -> None:
+        super().__init__()
+        if not scale_specs:
+            raise ValueError("scale_specs must not be empty.")
+        if top_k <= 0:
+            raise ValueError("top_k must be positive.")
+        self.scale_specs = dict(scale_specs)
+        self.scale_names = list(self.scale_specs)
+        self.expert_names = (["identity"] if include_identity_expert else []) + self.scale_names
+        self.input_channels = int(input_channels)
+        self.d_model = int(d_model)
+        self.max_context_length = max(spec.context_length for spec in self.scale_specs.values())
+        self.freq_count = self.max_context_length // 2 + 1
+        self.top_k = min(int(top_k), len(self.expert_names))
+        self.include_identity_expert = bool(include_identity_expert)
+
+        self.scale_embedding = LogScaleEmbedding(d_model)
+        self.frequency_embedding = nn.Sequential(
+            nn.LayerNorm(self.freq_count),
+            nn.Linear(self.freq_count, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+        self.router = nn.Sequential(
+            nn.LayerNorm(d_model * 2),
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, len(self.expert_names)),
+        )
+        self.scale_router_prior = nn.Embedding(3, len(self.expert_names))
+        nn.init.zeros_(self.scale_router_prior.weight)
+        with torch.no_grad():
+            offset = 1 if self.include_identity_expert else 0
+            for expert_idx, spec in enumerate(self.scale_specs.values()):
+                if spec.scale_id < self.scale_router_prior.weight.shape[0]:
+                    self.scale_router_prior.weight[spec.scale_id, expert_idx + offset] = float(scale_prior_strength)
+
+        self.asd_experts = nn.ModuleDict(
+            {
+                name: AdaptiveSpectralDenoising(d_model, init_gate=init_gate)
+                for name in self.scale_names
+            }
+        )
+        self.backbone = MultiScalePatchTST(
+            self.scale_specs,
+            input_channels=input_channels,
+            d_model=d_model,
+            n_heads=n_heads,
+            n_layers=n_layers,
+            d_ff=d_ff,
+            dropout=dropout,
+            encoder_spectral_mode="none",
+            lora_moe_mode=backbone_lora_moe_mode,
+            lora_moe_rank=lora_moe_rank,
+            lora_moe_alpha=lora_moe_alpha,
+            lora_moe_n_experts=lora_moe_n_experts,
+            lora_moe_top_k=lora_moe_top_k,
+            lora_moe_dropout=lora_moe_dropout,
+            head_type=head_type,
+            head_hidden_dim=head_hidden_dim,
+        )
+
+    def scale_embedding_for(self, scale_name: str, batch_size: int, device: torch.device) -> torch.Tensor:
+        spec = self.scale_specs[scale_name]
+        delta = torch.full((batch_size,), float(spec.delta_seconds), device=device)
+        scale_id = torch.full((batch_size,), int(spec.scale_id), device=device, dtype=torch.long)
+        return self.scale_embedding(delta, scale_id)
+
+    def pad_with_mask(self, past_values: torch.Tensor, scale_name: str) -> tuple[torch.Tensor, torch.Tensor]:
+        length = past_values.shape[1]
+        if length > self.max_context_length:
+            raise ValueError(f"{scale_name}: length {length} exceeds max padded length {self.max_context_length}.")
+        padded = F.pad(past_values, (0, 0, 0, self.max_context_length - length))
+        mask = torch.zeros(
+            past_values.shape[0],
+            self.max_context_length,
+            1,
+            dtype=past_values.dtype,
+            device=past_values.device,
+        )
+        mask[:, :length, :] = 1.0
+        return padded, mask
+
+    def router_weights(
+        self,
+        padded_values: torch.Tensor,
+        mask: torch.Tensor,
+        scale_name: str,
+        scale_emb: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        spec = self.scale_specs[scale_name]
+        masked_values = padded_values * mask
+        spectrum = torch.fft.rfft(masked_values.transpose(1, 2), dim=-1)
+        magnitude = torch.log1p(torch.abs(spectrum).mean(dim=1))
+        freq_emb = self.frequency_embedding(magnitude)
+        router_input = torch.cat([freq_emb, scale_emb], dim=-1)
+        scale_id = torch.full(
+            (padded_values.shape[0],),
+            int(spec.scale_id),
+            dtype=torch.long,
+            device=padded_values.device,
+        )
+        logits = self.router(router_input) + self.scale_router_prior(scale_id)
+        if self.top_k < logits.shape[-1]:
+            top_values, top_indices = torch.topk(logits, self.top_k, dim=-1)
+            masked_logits = torch.full_like(logits, float("-inf"))
+            masked_logits.scatter_(-1, top_indices, top_values)
+            weights = torch.softmax(masked_logits, dim=-1)
+        else:
+            weights = torch.softmax(logits, dim=-1)
+        return weights, logits, freq_emb
+
+    def forward(
+        self,
+        past_values: torch.Tensor,
+        scale_name: str,
+        *,
+        return_diagnostics: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if scale_name not in self.scale_specs:
+            raise ValueError(f"unknown scale {scale_name!r}; expected {sorted(self.scale_specs)}")
+        if past_values.ndim != 3:
+            raise ValueError(f"past_values must be [B,L,C], got {tuple(past_values.shape)}")
+        spec = self.scale_specs[scale_name]
+        if past_values.shape[1] != spec.context_length:
+            raise ValueError(f"{scale_name}: input length must be {spec.context_length}, got {past_values.shape[1]}")
+        if past_values.shape[2] != self.input_channels:
+            raise ValueError(f"input_channels must be {self.input_channels}, got {past_values.shape[2]}")
+
+        scale_emb = self.scale_embedding_for(scale_name, past_values.shape[0], past_values.device)
+        padded, mask = self.pad_with_mask(past_values, scale_name)
+        weights, _, freq_emb = self.router_weights(padded, mask, scale_name, scale_emb)
+
+        expert_outputs: list[torch.Tensor] = []
+        expert_gate_means: list[torch.Tensor] = []
+        expert_tau_means: list[torch.Tensor] = []
+        if self.include_identity_expert:
+            expert_outputs.append(padded)
+            expert_gate_means.append(torch.zeros((), dtype=past_values.dtype, device=past_values.device))
+            expert_tau_means.append(torch.zeros((), dtype=past_values.dtype, device=past_values.device))
+        for expert_name in self.scale_names:
+            clean, asd_diagnostics = self.asd_experts[expert_name](
+                padded,
+                scale_emb,
+                return_diagnostics=True,
+            )
+            expert_outputs.append(clean * mask)
+            expert_gate_means.append(asd_diagnostics["gate_mean"])
+            expert_tau_means.append(asd_diagnostics["tau_mean"])
+
+        stacked = torch.stack(expert_outputs, dim=-1)
+        routed_padded = (stacked * weights[:, None, None, :]).sum(dim=-1)
+        routed = routed_padded[:, : spec.context_length, :]
+        out = self.backbone(routed, scale_name, return_diagnostics=return_diagnostics)
+        if not return_diagnostics:
+            return out
+        if isinstance(out, tuple):
+            y, backbone_diagnostics = out
+        else:
+            y, backbone_diagnostics = out, {}
+
+        avg_prob = weights.mean(dim=0)
+        uniform = torch.full_like(avg_prob, 1.0 / len(self.expert_names))
+        entropy = -(weights * torch.log(weights.clamp_min(1e-8))).sum(dim=-1).mean()
+        asd_router_balance = F.mse_loss(avg_prob, uniform)
+        gate_stack = torch.stack(expert_gate_means)
+        tau_stack = torch.stack(expert_tau_means)
+        diagnostics: dict[str, torch.Tensor] = {
+            "router_entropy": entropy,
+            "router_balance_loss": asd_router_balance,
+            "asd_router_entropy": entropy,
+            "asd_router_balance_loss": asd_router_balance,
+            "frequency_embedding_norm": torch.mean(torch.linalg.vector_norm(freq_emb, dim=-1)),
+            "mean_abs_delta": torch.mean(torch.abs(routed - past_values)),
+            "asd_gate_mean": torch.sum(avg_prob * gate_stack),
+            "asd_tau_mean": torch.sum(avg_prob * tau_stack),
+            "valid_mask_mean": mask.mean(),
+            "padded_context_length": torch.tensor(
+                float(self.max_context_length),
+                dtype=past_values.dtype,
+                device=past_values.device,
+            ),
+        }
+        for expert_idx, expert_name in enumerate(self.expert_names):
+            diagnostics[f"expert_prob_{expert_idx}"] = avg_prob[expert_idx]
+            diagnostics[f"expert_{expert_name}_prob"] = avg_prob[expert_idx]
+        for expert_idx, expert_name in enumerate(self.scale_names):
+            diagnostics[f"expert_{expert_name}_gate_mean"] = expert_gate_means[
+                expert_idx + (1 if self.include_identity_expert else 0)
+            ]
+        diagnostics.update(backbone_diagnostics)
+        diagnostics.update({f"backbone_{key}": value for key, value in backbone_diagnostics.items()})
+        if "router_balance_loss" in backbone_diagnostics:
+            diagnostics["router_balance_loss"] = asd_router_balance + backbone_diagnostics["router_balance_loss"]
+            diagnostics["combined_router_balance_loss"] = diagnostics["router_balance_loss"]
+        return y, diagnostics
 
 
 class StaticASDMultiScalePatchTST(nn.Module):
@@ -895,6 +1477,125 @@ class ScaleAwareASDMultiScalePatchTST(nn.Module):
             return y, diagnostics
         y = out
         return y
+
+
+class SideASDFeatureMultiScalePatchTST(nn.Module):
+    """Keep the raw input path and append ASD residual as an auxiliary channel."""
+
+    def __init__(self, backbone: MultiScalePatchTST, *, init_gate: float = -4.0) -> None:
+        super().__init__()
+        if backbone.input_channels != 2 or backbone.target_mode != "all_channels":
+            raise ValueError("SideASDFeatureMultiScalePatchTST requires a 2-channel all_channels backbone.")
+        self.backbone = backbone
+        self.denoiser = AdaptiveSpectralDenoising(backbone.d_model, init_gate=init_gate)
+
+    def forward(
+        self,
+        past_values: torch.Tensor,
+        scale_name: str,
+        *,
+        return_diagnostics: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        scale_emb = self.backbone.scale_embedding_for(scale_name, past_values.shape[0], past_values.device)
+        clean, asd_diagnostics = self.denoiser(past_values, scale_emb, return_diagnostics=True)
+        residual = clean - past_values
+        augmented = torch.cat([past_values, residual], dim=-1)
+        out = self.backbone(augmented, scale_name, return_diagnostics=return_diagnostics)
+        if not return_diagnostics:
+            return out
+        if isinstance(out, tuple):
+            y, backbone_diagnostics = out
+        else:
+            y, backbone_diagnostics = out, {}
+        diagnostics: dict[str, torch.Tensor] = dict(asd_diagnostics)
+        diagnostics.update({f"asd_{key}": value for key, value in asd_diagnostics.items()})
+        diagnostics["side_residual_abs_mean"] = torch.mean(torch.abs(residual))
+        diagnostics.update(backbone_diagnostics)
+        diagnostics.update({f"moe_{key}": value for key, value in backbone_diagnostics.items()})
+        return y, diagnostics
+
+
+class ScaleAwareSequenceAdapter(nn.Module):
+    """Apply a scale-aware MoE adapter directly to a value sequence before PatchTST."""
+
+    def __init__(
+        self,
+        d_model: int,
+        *,
+        input_channels: int = 1,
+        adapter_kind: str = "lora_moe",
+        n_experts: int = 4,
+        rank: int = 8,
+        alpha: float = 16.0,
+        bottleneck: int = 8,
+        top_k: int = 2,
+        dropout: float = 0.1,
+        init_gate: float = -4.0,
+    ) -> None:
+        super().__init__()
+        if adapter_kind not in {"lora_moe", "mlp_moe"}:
+            raise ValueError("adapter_kind must be 'lora_moe' or 'mlp_moe'.")
+        self.adapter_kind = adapter_kind
+        self.input_channels = int(input_channels)
+        self.value_projection = nn.Linear(self.input_channels, d_model)
+        self.value_output = nn.Linear(d_model, self.input_channels)
+        self.gate_projection = nn.Linear(d_model, self.input_channels)
+        nn.init.constant_(self.gate_projection.bias, init_gate)
+        if adapter_kind == "lora_moe":
+            self.adapter = ScaleAwareLoRAAdapterMoE(
+                d_model,
+                n_experts=n_experts,
+                rank=rank,
+                alpha=alpha,
+                top_k=top_k,
+                dropout=dropout,
+            )
+        else:
+            self.adapter = ScaleAwareMLPAdapterMoE(
+                d_model,
+                n_experts=n_experts,
+                bottleneck=bottleneck,
+                top_k=top_k,
+                dropout=dropout,
+            )
+
+    def forward(
+        self,
+        values: torch.Tensor,
+        scale_emb: torch.Tensor,
+        *,
+        return_diagnostics: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if values.ndim != 3:
+            raise ValueError(f"values must be [B,L,C], got {tuple(values.shape)}")
+        batch_size, _, channels = values.shape
+        if channels != self.input_channels:
+            raise ValueError(f"input_channels must be {self.input_channels}, got {channels}")
+        if scale_emb.shape[0] != batch_size:
+            raise ValueError("scale_emb batch size must match values batch size.")
+
+        tokens = self.value_projection(values) + scale_emb[:, None, :]
+        adapted_tokens, adapter_diagnostics = self.adapter(tokens, scale_emb, return_diagnostics=True)
+        token_delta = adapted_tokens - tokens
+        value_delta = self.value_output(token_delta)
+        gate = torch.sigmoid(self.gate_projection(scale_emb))[:, None, :]
+        adapted_values = values + gate * value_delta
+        if not return_diagnostics:
+            return adapted_values
+
+        diagnostics: dict[str, torch.Tensor] = {
+            "pre_adapter_gate_mean": torch.mean(gate),
+            "pre_adapter_mean_abs_delta": torch.mean(torch.abs(adapted_values - values)),
+        }
+        diagnostics.update({f"pre_adapter_{key}": value for key, value in adapter_diagnostics.items()})
+        if "router_balance_loss" in adapter_diagnostics:
+            diagnostics["router_balance_loss"] = adapter_diagnostics["router_balance_loss"]
+        if "router_entropy" in adapter_diagnostics:
+            diagnostics["router_entropy"] = adapter_diagnostics["router_entropy"]
+        for key, value in adapter_diagnostics.items():
+            if key.startswith("expert_prob_") or key.startswith("scale_prior_prob_"):
+                diagnostics[key] = value
+        return adapted_values, diagnostics
 
 
 class LevelASDMultiScalePatchTST(nn.Module):
@@ -968,6 +1669,389 @@ class LevelASDMultiScalePatchTST(nn.Module):
         return y, diagnostics
 
 
+class PreprocessedASDAdapterPatchTST(nn.Module):
+    """Run ASD plus a sequence MoE adapter before feeding returns into PatchTST."""
+
+    def __init__(
+        self,
+        backbone: MultiScalePatchTST,
+        *,
+        input_mode: str = "return",
+        price_mode: str = "log_price",
+        adapter_kind: str = "lora_moe",
+        init_gate: float = -4.0,
+        n_experts: int = 4,
+        rank: int = 8,
+        alpha: float = 16.0,
+        bottleneck: int = 8,
+        top_k: int = 2,
+        dropout: float = 0.1,
+        residual_to_raw: bool = False,
+        final_gate_init: float = -2.0,
+    ) -> None:
+        super().__init__()
+        if input_mode not in {"return", "level"}:
+            raise ValueError("input_mode must be 'return' or 'level'.")
+        if price_mode not in {"log_price", "raw_price"}:
+            raise ValueError("price_mode must be 'log_price' or 'raw_price'.")
+        if backbone.input_channels != 1:
+            raise ValueError("PreprocessedASDAdapterPatchTST currently expects one input channel.")
+        self.backbone = backbone
+        self.input_mode = input_mode
+        self.price_mode = price_mode
+        self.residual_to_raw = bool(residual_to_raw)
+        self.denoiser = AdaptiveSpectralDenoising(backbone.d_model, init_gate=init_gate)
+        self.pre_adapter = ScaleAwareSequenceAdapter(
+            backbone.d_model,
+            input_channels=1,
+            adapter_kind=adapter_kind,
+            n_experts=n_experts,
+            rank=rank,
+            alpha=alpha,
+            bottleneck=bottleneck,
+            top_k=top_k,
+            dropout=dropout,
+            init_gate=init_gate,
+        )
+        self.final_gate_projection = nn.Linear(backbone.d_model, 1)
+        nn.init.zeros_(self.final_gate_projection.weight)
+        nn.init.constant_(self.final_gate_projection.bias, final_gate_init)
+        self.return_input_stats: dict[str, tuple[float, float]] = {}
+
+    def set_return_input_stats(self, scale_name: str, *, mean: float, std: float) -> None:
+        if scale_name not in self.backbone.scale_specs:
+            raise ValueError(f"unknown scale {scale_name!r}; expected {sorted(self.backbone.scale_specs)}")
+        self.return_input_stats[scale_name] = (float(mean), float(max(std, 1e-12)))
+
+    def forward(
+        self,
+        past_values: torch.Tensor,
+        scale_name: str,
+        *,
+        return_diagnostics: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if scale_name not in self.backbone.scale_specs:
+            raise ValueError(f"unknown scale {scale_name!r}; expected {sorted(self.backbone.scale_specs)}")
+        if past_values.ndim != 3:
+            raise ValueError(f"past_values must be [B,L,C], got {tuple(past_values.shape)}")
+        spec = self.backbone.scale_specs[scale_name]
+        if past_values.shape[1] != spec.context_length:
+            raise ValueError(f"{scale_name}: input length must be {spec.context_length}, got {past_values.shape[1]}")
+
+        scale_emb = self.backbone.scale_embedding_for(scale_name, past_values.shape[0], past_values.device)
+        clean, asd_diagnostics = self.denoiser(past_values, scale_emb, return_diagnostics=True)
+        adapted, adapter_diagnostics = self.pre_adapter(clean, scale_emb, return_diagnostics=True)
+        final_gate = torch.sigmoid(self.final_gate_projection(scale_emb))[:, None, :]
+        if self.residual_to_raw:
+            model_input = past_values + final_gate * (adapted - past_values)
+        else:
+            model_input = adapted
+
+        if self.input_mode == "level":
+            patch_input = torch.zeros_like(model_input)
+            if self.price_mode == "log_price":
+                patch_input[:, 1:, :] = model_input[:, 1:, :] - model_input[:, :-1, :]
+            else:
+                safe_levels = torch.clamp(model_input, min=1e-6)
+                patch_input[:, 1:, :] = torch.log(safe_levels[:, 1:, :]) - torch.log(safe_levels[:, :-1, :])
+            if scale_name in self.return_input_stats:
+                mean, std = self.return_input_stats[scale_name]
+                patch_input = (patch_input - mean) / std
+        else:
+            patch_input = model_input
+
+        out = self.backbone(patch_input, scale_name, return_diagnostics=return_diagnostics)
+        if not return_diagnostics:
+            return out
+        if isinstance(out, tuple):
+            y, backbone_diagnostics = out
+        else:
+            y, backbone_diagnostics = out, {}
+        diagnostics: dict[str, torch.Tensor] = {
+            "gate_mean": asd_diagnostics["gate_mean"],
+            "tau_mean": asd_diagnostics["tau_mean"],
+            "mean_abs_delta": asd_diagnostics["mean_abs_delta"],
+            "asd_gate_mean": asd_diagnostics["gate_mean"],
+            "asd_tau_mean": asd_diagnostics["tau_mean"],
+            "asd_mean_abs_delta": asd_diagnostics["mean_abs_delta"],
+            "patch_input_abs_mean": torch.mean(torch.abs(patch_input)),
+            "final_gate_mean": torch.mean(final_gate),
+            "final_mean_abs_delta": torch.mean(torch.abs(model_input - past_values)),
+        }
+        diagnostics.update(adapter_diagnostics)
+        diagnostics.update(backbone_diagnostics)
+        diagnostics.update({f"backbone_{key}": value for key, value in backbone_diagnostics.items()})
+        return y, diagnostics
+
+
+class ScaleSpecificGatedPreprocessedASDAdapterPatchTST(nn.Module):
+    """Use scale-specific pre-PatchTST adapters with a protected raw residual path."""
+
+    def __init__(
+        self,
+        backbone: MultiScalePatchTST,
+        *,
+        init_gate: float = -4.0,
+        n_experts: int = 4,
+        rank: int = 8,
+        alpha: float = 16.0,
+        bottleneck: int = 8,
+        top_k: int = 2,
+        dropout: float = 0.1,
+        scale_adapter_kind: dict[str, str] | None = None,
+        scale_gate_init: dict[str, float] | None = None,
+    ) -> None:
+        super().__init__()
+        if backbone.input_channels != 1:
+            raise ValueError("ScaleSpecificGatedPreprocessedASDAdapterPatchTST expects one input channel.")
+        self.backbone = backbone
+        self.denoiser = AdaptiveSpectralDenoising(backbone.d_model, init_gate=init_gate)
+        self.adapters = nn.ModuleDict(
+            {
+                "lora_moe": ScaleAwareSequenceAdapter(
+                    backbone.d_model,
+                    input_channels=1,
+                    adapter_kind="lora_moe",
+                    n_experts=n_experts,
+                    rank=rank,
+                    alpha=alpha,
+                    bottleneck=bottleneck,
+                    top_k=top_k,
+                    dropout=dropout,
+                    init_gate=init_gate,
+                ),
+                "mlp_moe": ScaleAwareSequenceAdapter(
+                    backbone.d_model,
+                    input_channels=1,
+                    adapter_kind="mlp_moe",
+                    n_experts=n_experts,
+                    rank=rank,
+                    alpha=alpha,
+                    bottleneck=bottleneck,
+                    top_k=top_k,
+                    dropout=dropout,
+                    init_gate=init_gate,
+                ),
+            }
+        )
+        self.scale_adapter_kind = {
+            name: "lora_moe" for name in self.backbone.scale_specs
+        }
+        self.scale_adapter_kind.update(scale_adapter_kind or {})
+        for scale_name, adapter_kind in self.scale_adapter_kind.items():
+            if adapter_kind not in self.adapters:
+                raise ValueError(f"{scale_name}: unknown adapter kind {adapter_kind!r}")
+        default_gate_init = {"second": -6.0, "minute": -2.5, "hour": -1.5}
+        default_gate_init.update(scale_gate_init or {})
+        self.final_gate_projection = nn.Linear(backbone.d_model, 1)
+        nn.init.zeros_(self.final_gate_projection.weight)
+        nn.init.zeros_(self.final_gate_projection.bias)
+        self.scale_gate_bias = nn.ParameterDict(
+            {
+                name: nn.Parameter(torch.tensor([float(default_gate_init.get(name, -3.0))]))
+                for name in self.backbone.scale_specs
+            }
+        )
+
+    def forward(
+        self,
+        past_values: torch.Tensor,
+        scale_name: str,
+        *,
+        return_diagnostics: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if scale_name not in self.backbone.scale_specs:
+            raise ValueError(f"unknown scale {scale_name!r}; expected {sorted(self.backbone.scale_specs)}")
+        scale_emb = self.backbone.scale_embedding_for(scale_name, past_values.shape[0], past_values.device)
+        clean, asd_diagnostics = self.denoiser(past_values, scale_emb, return_diagnostics=True)
+        adapter_kind = self.scale_adapter_kind[scale_name]
+        adapted, adapter_diagnostics = self.adapters[adapter_kind](clean, scale_emb, return_diagnostics=True)
+        gate_logits = self.final_gate_projection(scale_emb) + self.scale_gate_bias[scale_name]
+        final_gate = torch.sigmoid(gate_logits)[:, None, :]
+        patch_input = past_values + final_gate * (adapted - past_values)
+        out = self.backbone(patch_input, scale_name, return_diagnostics=return_diagnostics)
+        if not return_diagnostics:
+            return out
+        if isinstance(out, tuple):
+            y, backbone_diagnostics = out
+        else:
+            y, backbone_diagnostics = out, {}
+        diagnostics: dict[str, torch.Tensor] = {
+            "gate_mean": asd_diagnostics["gate_mean"],
+            "tau_mean": asd_diagnostics["tau_mean"],
+            "mean_abs_delta": asd_diagnostics["mean_abs_delta"],
+            "asd_gate_mean": asd_diagnostics["gate_mean"],
+            "asd_tau_mean": asd_diagnostics["tau_mean"],
+            "asd_mean_abs_delta": asd_diagnostics["mean_abs_delta"],
+            "final_gate_mean": torch.mean(final_gate),
+            "final_mean_abs_delta": torch.mean(torch.abs(patch_input - past_values)),
+            "patch_input_abs_mean": torch.mean(torch.abs(patch_input)),
+            "adapter_kind_id": torch.tensor(
+                0.0 if adapter_kind == "lora_moe" else 1.0,
+                dtype=past_values.dtype,
+                device=past_values.device,
+            ),
+        }
+        diagnostics.update(adapter_diagnostics)
+        diagnostics.update(backbone_diagnostics)
+        diagnostics.update({f"backbone_{key}": value for key, value in backbone_diagnostics.items()})
+        return y, diagnostics
+
+
+class PaddedFrequencyMoEASDPatchTST(nn.Module):
+    """Pad variable-scale windows, route them to scale-specific ASD experts, then use PatchTST."""
+
+    def __init__(
+        self,
+        backbone: MultiScalePatchTST,
+        *,
+        init_gate: float = -4.0,
+        top_k: int = 2,
+        router_prior_strength: float = 1.5,
+    ) -> None:
+        super().__init__()
+        if backbone.input_channels != 1:
+            raise ValueError("PaddedFrequencyMoEASDPatchTST currently expects one input channel.")
+        if top_k <= 0:
+            raise ValueError("top_k must be positive.")
+        self.backbone = backbone
+        self.max_context_length = max(spec.context_length for spec in backbone.scale_specs.values())
+        self.scale_names = list(backbone.scale_specs)
+        self.frequency_embedding = LogScaleEmbedding(backbone.d_model)
+        self.denoisers = nn.ModuleDict(
+            {
+                name: AdaptiveSpectralDenoising(backbone.d_model, init_gate=init_gate)
+                for name in self.scale_names
+            }
+        )
+        self.router = nn.Sequential(
+            nn.Linear(backbone.d_model + 4, backbone.d_model),
+            nn.GELU(),
+            nn.Linear(backbone.d_model, len(self.scale_names)),
+        )
+        self.top_k = min(int(top_k), len(self.scale_names))
+        self.router_prior_strength = float(router_prior_strength)
+
+    def _pad_left(self, values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, length, channels = values.shape
+        if length > self.max_context_length:
+            raise ValueError(
+                f"input length {length} exceeds max_context_length={self.max_context_length}."
+            )
+        pad_length = self.max_context_length - length
+        if pad_length:
+            pad = values.new_zeros(batch_size, pad_length, channels)
+            padded = torch.cat([pad, values], dim=1)
+            mask = torch.cat(
+                [
+                    values.new_zeros(batch_size, pad_length, channels),
+                    values.new_ones(batch_size, length, channels),
+                ],
+                dim=1,
+            )
+        else:
+            padded = values
+            mask = values.new_ones(batch_size, length, channels)
+        return padded, mask
+
+    def _router_weights(
+        self,
+        padded: torch.Tensor,
+        mask: torch.Tensor,
+        scale_name: str,
+        freq_emb: torch.Tensor,
+    ) -> torch.Tensor:
+        valid_count = mask.sum(dim=(1, 2)).clamp_min(1.0)
+        mean = (padded * mask).sum(dim=(1, 2), keepdim=False) / valid_count
+        centered = (padded - mean[:, None, None]) * mask
+        std = torch.sqrt((centered.pow(2).sum(dim=(1, 2)) / valid_count).clamp_min(1e-8))
+        abs_mean = (padded.abs() * mask).sum(dim=(1, 2)) / valid_count
+        length_ratio = torch.full_like(mean, padded.shape[1] / float(self.max_context_length))
+        router_features = torch.cat(
+            [freq_emb, mean[:, None], std[:, None], abs_mean[:, None], length_ratio[:, None]],
+            dim=-1,
+        )
+        logits = self.router(router_features)
+        scale_idx = self.scale_names.index(scale_name)
+        prior = torch.zeros_like(logits)
+        prior[:, scale_idx] = self.router_prior_strength
+        logits = logits + prior
+        if self.top_k < len(self.scale_names):
+            top_val, top_idx = torch.topk(logits, self.top_k, dim=-1)
+            masked_logits = torch.full_like(logits, float("-inf"))
+            masked_logits.scatter_(-1, top_idx, top_val)
+            return torch.softmax(masked_logits, dim=-1)
+        return torch.softmax(logits, dim=-1)
+
+    def forward(
+        self,
+        past_values: torch.Tensor,
+        scale_name: str,
+        *,
+        return_diagnostics: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if scale_name not in self.backbone.scale_specs:
+            raise ValueError(f"unknown scale {scale_name!r}; expected {sorted(self.backbone.scale_specs)}")
+        if past_values.ndim != 3:
+            raise ValueError(f"past_values must be [B,L,C], got {tuple(past_values.shape)}")
+        spec = self.backbone.scale_specs[scale_name]
+        if past_values.shape[1] != spec.context_length:
+            raise ValueError(f"{scale_name}: input length must be {spec.context_length}, got {past_values.shape[1]}")
+
+        padded, mask = self._pad_left(past_values)
+        batch_size = past_values.shape[0]
+        device = past_values.device
+        scale_spec = self.backbone.scale_specs[scale_name]
+        delta = torch.full((batch_size,), float(scale_spec.delta_seconds), device=device)
+        scale_id = torch.full((batch_size,), int(scale_spec.scale_id), device=device, dtype=torch.long)
+        freq_emb = self.frequency_embedding(delta, scale_id)
+        weights = self._router_weights(padded, mask, scale_name, freq_emb)
+
+        expert_outputs: list[torch.Tensor] = []
+        expert_diagnostics: list[dict[str, torch.Tensor]] = []
+        for expert_name in self.scale_names:
+            denoised, diagnostics = self.denoisers[expert_name](
+                padded * mask,
+                freq_emb,
+                return_diagnostics=True,
+            )
+            expert_outputs.append(denoised)
+            expert_diagnostics.append(diagnostics)
+        stacked = torch.stack(expert_outputs, dim=-2)
+        mixed = (weights[:, None, None, :, None] * stacked).sum(dim=-2)
+        mixed = mixed * mask + padded * (1.0 - mask)
+        clean = mixed[:, -spec.context_length :, :]
+
+        out = self.backbone(clean, scale_name, return_diagnostics=return_diagnostics)
+        if not return_diagnostics:
+            return out
+        if isinstance(out, tuple):
+            y, backbone_diagnostics = out
+        else:
+            y, backbone_diagnostics = out, {}
+        avg_prob = weights.mean(dim=0)
+        entropy = -(weights * torch.log(weights.clamp_min(1e-8))).sum(dim=-1).mean()
+        uniform = torch.full_like(avg_prob, 1.0 / avg_prob.numel())
+        diagnostics: dict[str, torch.Tensor] = {
+            "router_entropy": entropy,
+            "router_balance_loss": F.mse_loss(avg_prob, uniform),
+            "padding_fraction": torch.tensor(
+                1.0 - (float(spec.context_length) / float(self.max_context_length)),
+                dtype=past_values.dtype,
+                device=device,
+            ),
+            "freq_emb_norm": torch.mean(torch.norm(freq_emb, dim=-1)),
+            "mean_abs_delta": torch.mean(torch.abs(clean - past_values)),
+        }
+        for idx, expert_name in enumerate(self.scale_names):
+            diagnostics[f"expert_prob_{idx}"] = avg_prob[idx]
+            diagnostics[f"{expert_name}_asd_gate_mean"] = expert_diagnostics[idx]["gate_mean"]
+            diagnostics[f"{expert_name}_asd_tau_mean"] = expert_diagnostics[idx]["tau_mean"]
+        diagnostics.update(backbone_diagnostics)
+        diagnostics.update({f"backbone_{key}": value for key, value in backbone_diagnostics.items()})
+        return y, diagnostics
+
+
 def build_multiscale_patchtst(
     scale_specs: dict[str, ScaleSpec] | None = None,
     *,
@@ -986,6 +2070,8 @@ def build_multiscale_patchtst(
     lora_moe_top_k: int = 2,
     lora_moe_dropout: float = 0.1,
     target_mode: str = "per_channel",
+    head_type: str = "linear",
+    head_hidden_dim: int = 128,
 ) -> MultiScalePatchTST:
     return MultiScalePatchTST(
         default_scale_specs() if scale_specs is None else scale_specs,
@@ -1004,4 +2090,6 @@ def build_multiscale_patchtst(
         lora_moe_top_k=lora_moe_top_k,
         lora_moe_dropout=lora_moe_dropout,
         target_mode=target_mode,
+        head_type=head_type,
+        head_hidden_dim=head_hidden_dim,
     )

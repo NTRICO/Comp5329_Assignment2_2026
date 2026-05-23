@@ -1,4 +1,0 @@
-diagnostic,correlation,interpretation
-target_vs_wap1_last,-0.7087963406060317,Large negative values suggest current price level predicts a cross-time_id normalization reset.
-target_vs_1_over_wap1_last_minus_1,0.7090680046726558,Large positive values suggest the target is close to a reset-to-one effect.
-target_vs_same_bucket_wap1_return,-0.5838545715894107,Large values indicate short-horizon continuation/reversal rather than independent next-bucket signal.

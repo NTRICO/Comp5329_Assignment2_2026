@@ -1,137 +1,139 @@
-# COMP5329 PatchTST Optimization for Financial Time Series
+# COMP5329 PatchTST Financial Forecasting
 
-This repository is now organized around optimizing and stress-testing PatchTST
-for noisy financial time-series forecasting. The earlier FinCast position-trader
-pipeline remains in the codebase as historical baseline infrastructure, but the
-main assignment direction is PatchTST-centric model adaptation.
+This repository now focuses on one assignment direction: improving PatchTST for
+multi-scale intraday financial return forecasting.
 
-The current experiments focus on:
+The active data protocol uses Optiver-style intraday windows at three scales:
 
-- multi-scale PatchTST baselines on second, minute, hour, day, and week data;
-- Optiver high-frequency feature caches and FinCast-Paper-test benchmarks;
-- lightweight denoising and adaptation modules around PatchTST;
-- robustness checks that compare raw PatchTST against ASD, LoRA-MoE, and
-  supplementary multi-channel or level-domain variants.
+- `second`
+- `minute`
+- `hour`
 
-## Project Layout
+Day/week trader and FinCast-position-control experiments were removed from the
+tracked project history so teammates can read this checkout as a PatchTST
+optimization codebase.
 
-```text
-src/
-  baselines/
-    patchtst_lora.py              Self-contained PatchTST + LoRA baseline
-    scale_aware_asd_patchtst.py   Scale-aware ASD / adapter modules
-    position_rules.py             Simple policy baselines for legacy tests
-  datasets/
-    optiver_features.py           Optiver high-frequency feature utilities
-    trader_dataset.py             Legacy and cache-backed sequence datasets
-  eval/
-    metrics.py                    Forecasting and backtest metrics
-    backtest.py                   Legacy policy/backtest utilities
-  fincast_io/
-    simple_forecaster.py          Lightweight FinCast-style forecaster helpers
-  trader/
-    ...                           Historical position-trader components
-scripts/
-  evaluate_*patchtst*.py          PatchTST benchmark and ablation entrypoints
-  build_optiver_*.py              Optiver feature/cache builders
-  train_patchtst_lora.py          Daily-cache PatchTST LoRA baseline
-  train_trader.py                 Historical FinCast trader trainer
-report/
-  README.md                       Current PatchTST result index
-  *_patchtst*.md                  Experiment notes and robustness reports
-tests/
-  test_*patchtst*.py              PatchTST and adapter smoke tests
-  test_optiver_features.py        Feature/cache tests
-```
+## Current Best Model
 
-## Local Artifacts
-
-Large datasets, checkpoints, and generated outputs are intentionally kept local.
-They are required to reproduce the experiments, but they should not be committed:
+The current robust main model is:
 
 ```text
-.conda-fincast/                         Local Python environment
-FinCast-fts/                            Frozen upstream FinCast source tree
-third_party/PatchTST/                   Local PatchTST reference checkout
-models/                                 Local checkpoints
-data/cache/                             Generated NPZ caches
-data/high-frequency/                    Optiver high-frequency source data
-data/fincast_inputs/                    Generated FinCast-style inputs
-data/raw/FinCast-Paper-test/            Local copy of the paper-test data
-outputs/                                Experiment outputs and checkpoints
+return window
+-> per-scale normalization
+-> scale-aware ASD denoising
+-> scale-aware LoRA-MoE sequence adapter
+-> gated residual back to raw return input
+-> scale-specific patch embedding
+-> shared PatchTST encoder
+-> scale-specific linear head
+-> future return prediction
 ```
 
-Use the local project interpreter for experiments:
+In code this is the `gated_pre_return_asd_lora_moe_patchtst` configuration in
+`scripts/evaluate_prepatch_asd_adapter_patchtst.py`, wrapped by the 32-stock
+multi-seed runner:
 
 ```powershell
-& ".\.conda-fincast\python.exe" <script>
+.\.conda-fincast\python.exe scripts\evaluate_gated_pre_asd_32stock_multiseed.py
 ```
 
-The system Python is not the reliable environment for this checkout.
-
-## Main Experiment Entrypoints
-
-Vanilla PatchTST and time-scale baselines:
-
-```powershell
-& ".\.conda-fincast\python.exe" scripts\evaluate_vanilla_timescales_additional_stock.py
-& ".\.conda-fincast\python.exe" scripts\evaluate_abc_vanilla_timescales.py
-& ".\.conda-fincast\python.exe" scripts\evaluate_hf_fincast_paper_test.py
-```
-
-Spectral denoising and scale-aware ASD:
-
-```powershell
-& ".\.conda-fincast\python.exe" scripts\evaluate_optiver_spectral_denoise_patchtst.py
-& ".\.conda-fincast\python.exe" scripts\evaluate_scale_aware_asd_patchtst.py
-```
-
-Supplementary model variants:
-
-```powershell
-& ".\.conda-fincast\python.exe" scripts\train_patchtst_lora.py
-& ".\.conda-fincast\python.exe" scripts\evaluate_level_asd_patchtst.py
-& ".\.conda-fincast\python.exe" scripts\evaluate_multichannel_patchtst.py
-```
-
-Historical FinCast trader commands are still available, but they are no longer
-the primary narrative for the assignment.
-
-## Evidence Map
-
-The concise report index is:
+The strongest follow-up candidate is the 15-channel variant:
 
 ```text
+multi-channel intraday features
+-> scale-aware ASD
+-> shared PatchTST
+-> LoRA-MoE
+-> scale-specific head
+```
+
+Its multi-seed confirmation runner is:
+
+```powershell
+.\.conda-fincast\python.exe scripts\evaluate_multichannel_patchtst_multiseed.py
+```
+
+## Best Config Files
+
+- `configs/recommended_patchtst_main.json`: current robust main model.
+- `configs/multichannel_candidate.json`: higher-potential 15-channel candidate.
+
+## Main Files
+
+```text
+src/baselines/patchtst_lora.py
+    Self-contained PatchTST baseline and LoRA primitives.
+
+src/baselines/scale_aware_asd_patchtst.py
+    Multi-scale PatchTST, ASD, LoRA-MoE, ASB, pre-PatchTST adapters,
+    multi-channel support, and experimental variants.
+
+scripts/evaluate_gated_pre_asd_32stock_multiseed.py
+    Main 32-stock multi-seed confirmation for the selected robust model.
+
+scripts/evaluate_multichannel_patchtst.py
+scripts/evaluate_multichannel_patchtst_multiseed.py
+    15-channel raw / ASD / LoRA-MoE experiments.
+
+scripts/evaluate_prepatch_asd_adapter_patchtst.py
+    Pre-PatchTST ASD + adapter ablations.
+
+scripts/evaluate_scale_aware_asd_patchtst.py
+    General ASD / LoRA-MoE / ASB ablation runner.
+
+scripts/build_optiver_second_feature_cache.py
+scripts/build_optiver_feature_cache.py
+    Cache builders for the local Optiver intraday data.
+```
+
+## Reports For Teammates
+
+Start here:
+
+```text
+report/TEAMMATE_HANDOFF.md
 report/README.md
 ```
 
-It records the committed, human-readable evidence tables for:
+The report files intentionally summarize results as percentage changes against
+the relevant raw PatchTST baseline. Large CSV outputs and checkpoints are not
+tracked by Git.
 
-- vanilla PatchTST and FinCast-Paper-test baselines;
-- raw vs spectral-denoised PatchTST;
-- scale-aware ASD robustness;
-- ASD + LoRA-MoE guardrails;
-- multi-channel and level-ASD supplementary runs.
+## Local Artifacts
 
-Generated CSV/JSON/PNG artifacts remain under `outputs/` for local inspection.
+These are intentionally ignored:
 
-## Testing
-
-Run focused tests with the local interpreter:
-
-```powershell
-& ".\.conda-fincast\python.exe" -m pytest tests
+```text
+.conda-fincast/
+models/
+data/cache/
+data/high-frequency/
+outputs/
+FinCast-fts/
+third_party/PatchTST/
 ```
 
-If `pytest` is unavailable in the local environment, run the relevant test
-modules directly or install the test dependency in `.conda-fincast`.
+The local interpreter used for all current experiments is:
 
-## Notes
+```powershell
+.\.conda-fincast\python.exe
+```
 
-- PatchTST is treated as a forecasting backbone, not a trading policy.
-- Strong zero-return baselines are expected on several financial forecasting
-  surfaces, so results should be interpreted against zero and last-return rows.
-- Hour-scale results often have much smaller test counts than second-scale
-  results; report them with the corresponding sample-size caveat.
-- FinCast remains useful as a benchmark and data source, but the project story is
-  PatchTST optimization.
+If a teammate does not have the local cache, they need the Optiver cache file
+under `data/cache/` or must rebuild it with the cache builder scripts.
+
+## Quick Validation
+
+```powershell
+.\.conda-fincast\python.exe -m py_compile `
+  src/baselines/patchtst_lora.py `
+  src/baselines/scale_aware_asd_patchtst.py `
+  scripts/evaluate_gated_pre_asd_32stock_multiseed.py `
+  scripts/evaluate_multichannel_patchtst_multiseed.py
+```
+
+Focused tests:
+
+```powershell
+.\.conda-fincast\python.exe -m pytest tests/test_patchtst_lora.py tests/test_scale_aware_asd_patchtst.py
+```
