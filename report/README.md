@@ -29,6 +29,12 @@ It is selected because it is the most stable unified three-scale model in the
 The best open challenger is the multi-channel ASD + LoRA-MoE variant. It improves
 second/hour more strongly but still has unstable minute-scale behavior.
 
+The newest exploratory challenger is the routed composite ASD-adapter MoE branch.
+It routes each position to composite experts that pair ASD with LoRA/MLP
+enhancers. The current default expert layout is `one_mlp`
+(`[ASD+LoRA, ASD+LoRA, ASD+LoRA, ASD+MLP]`). It is not the main paper claim yet
+because minute-scale behavior is still fragile.
+
 ## Key Reports
 
 - `gated_pre_asd_32stock_multiseed.md`: selected robust main model.
@@ -42,6 +48,12 @@ second/hour more strongly but still has unstable minute-scale behavior.
   the earlier small-data hour gain did not replicate on 32-stock data.
 - `asd_moe_conflict_diagnosis.md`: why ASD and MoE/LoRA can conflict.
 - `scale_aware_asd_lora_moe_final_decision.md`: earlier combined-model gate.
+- `composite_asd_adapter_moe_progress.md`: current routed composite ASD-adapter
+  MoE challenger and one-MLP decision trail.
+- `composite_asd_adapter_moe_3seed_quick_summary.md`: three-seed quick check for
+  the first composite router.
+- `composite_asd_adapter_moe_one_mlp_default_small_seed42.md`: default one-MLP
+  small-data smoke/quick result.
 
 ## Reporting Rule
 

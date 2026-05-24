@@ -1598,6 +1598,289 @@ class ScaleAwareSequenceAdapter(nn.Module):
         return adapted_values, diagnostics
 
 
+class CompositeASDAdapterExpert(nn.Module):
+    """One routed expert with its own ASD module and lightweight value enhancer."""
+
+    def __init__(
+        self,
+        d_model: int,
+        *,
+        input_channels: int = 1,
+        adapter_kind: str = "lora",
+        rank: int = 8,
+        alpha: float = 16.0,
+        bottleneck: int = 8,
+        dropout: float = 0.1,
+        init_gate: float = -4.0,
+    ) -> None:
+        super().__init__()
+        if adapter_kind not in {"lora", "mlp"}:
+            raise ValueError("adapter_kind must be 'lora' or 'mlp'.")
+        self.adapter_kind = adapter_kind
+        self.input_channels = int(input_channels)
+        self.denoiser = AdaptiveSpectralDenoising(d_model, init_gate=init_gate)
+        self.value_projection = nn.Linear(self.input_channels, d_model)
+        self.value_output = nn.Linear(d_model, self.input_channels)
+        self.gate_projection = nn.Linear(d_model, self.input_channels)
+        nn.init.constant_(self.gate_projection.bias, init_gate)
+        if adapter_kind == "lora":
+            self.adapter = LoRAAdapterExpert(d_model, rank, alpha=alpha, dropout=dropout)
+        else:
+            self.adapter = MLPAdapterExpert(d_model, bottleneck, dropout=dropout)
+
+    def forward(
+        self,
+        values: torch.Tensor,
+        scale_emb: torch.Tensor,
+        *,
+        return_diagnostics: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if values.ndim != 3:
+            raise ValueError(f"values must be [B,L,C], got {tuple(values.shape)}")
+        batch_size, _, channels = values.shape
+        if channels != self.input_channels:
+            raise ValueError(f"input_channels must be {self.input_channels}, got {channels}")
+        clean, asd_diagnostics = self.denoiser(values, scale_emb, return_diagnostics=True)
+        tokens = self.value_projection(clean) + scale_emb[:, None, :]
+        token_update = self.adapter(tokens)
+        value_delta = self.value_output(token_update)
+        gate = torch.sigmoid(self.gate_projection(scale_emb))[:, None, :]
+        out = clean + gate * value_delta
+        if not return_diagnostics:
+            return out
+        diagnostics: dict[str, torch.Tensor] = {
+            "asd_gate_mean": asd_diagnostics["gate_mean"],
+            "asd_tau_mean": asd_diagnostics["tau_mean"],
+            "asd_mean_abs_delta": asd_diagnostics["mean_abs_delta"],
+            "enhance_gate_mean": torch.mean(gate),
+            "enhance_mean_abs_delta": torch.mean(torch.abs(out - clean)),
+            "expert_mean_abs_delta": torch.mean(torch.abs(out - values)),
+            "adapter_kind_id": torch.tensor(
+                0.0 if self.adapter_kind == "lora" else 1.0,
+                dtype=values.dtype,
+                device=values.device,
+            ),
+        }
+        return out, diagnostics
+
+
+class CompositeASDAdapterMoE(nn.Module):
+    """Route each value position to composite ASD+adapter experts before PatchTST."""
+
+    def __init__(
+        self,
+        d_model: int,
+        *,
+        max_context_length: int,
+        input_channels: int = 1,
+        expert_kinds: tuple[str, ...] = ("lora", "mlp", "lora", "mlp"),
+        rank: int = 8,
+        alpha: float = 16.0,
+        bottleneck: int = 8,
+        top_k: int = 2,
+        dropout: float = 0.1,
+        init_gate: float = -4.0,
+    ) -> None:
+        super().__init__()
+        if max_context_length <= 0:
+            raise ValueError("max_context_length must be positive.")
+        if not expert_kinds:
+            raise ValueError("expert_kinds must not be empty.")
+        for kind in expert_kinds:
+            if kind not in {"lora", "mlp"}:
+                raise ValueError("expert_kinds entries must be 'lora' or 'mlp'.")
+        n_experts = len(expert_kinds)
+        if top_k <= 0 or top_k > n_experts:
+            raise ValueError("top_k must be in [1, n_experts].")
+        self.d_model = int(d_model)
+        self.input_channels = int(input_channels)
+        self.max_context_length = int(max_context_length)
+        self.n_experts = int(n_experts)
+        self.top_k = int(top_k)
+        self.value_projection = nn.Linear(self.input_channels, d_model)
+        self.position_embedding = nn.Parameter(torch.zeros(1, self.max_context_length, d_model))
+        self.router = nn.Linear(d_model * 2, self.n_experts)
+        self.scale_router = nn.Linear(d_model, self.n_experts, bias=False)
+        self.experts = nn.ModuleList(
+            [
+                CompositeASDAdapterExpert(
+                    d_model,
+                    input_channels=self.input_channels,
+                    adapter_kind=kind,
+                    rank=rank,
+                    alpha=alpha,
+                    bottleneck=bottleneck,
+                    dropout=dropout,
+                    init_gate=init_gate,
+                )
+                for kind in expert_kinds
+            ]
+        )
+        nn.init.trunc_normal_(self.position_embedding, std=0.02)
+        nn.init.zeros_(self.scale_router.weight)
+
+    def routing_weights(self, values: torch.Tensor, scale_emb: torch.Tensor) -> torch.Tensor:
+        if values.ndim != 3:
+            raise ValueError(f"values must be [B,L,C], got {tuple(values.shape)}")
+        batch_size, length, channels = values.shape
+        if channels != self.input_channels:
+            raise ValueError(f"input_channels must be {self.input_channels}, got {channels}")
+        if length > self.max_context_length:
+            raise ValueError(f"context length {length} exceeds max_context_length={self.max_context_length}")
+        if scale_emb.shape != (batch_size, self.d_model):
+            raise ValueError(f"scale_emb must be [{batch_size},{self.d_model}], got {tuple(scale_emb.shape)}")
+
+        tokens = self.value_projection(values)
+        tokens = tokens + self.position_embedding[:, :length, :] + scale_emb[:, None, :]
+        scale_tokens = scale_emb[:, None, :].expand(batch_size, length, self.d_model)
+        logits = self.router(torch.cat([tokens, scale_tokens], dim=-1))
+        logits = logits + self.scale_router(scale_emb)[:, None, :]
+        if self.top_k < self.n_experts:
+            top_values, top_indices = torch.topk(logits, self.top_k, dim=-1)
+            masked_logits = torch.full_like(logits, float("-inf"))
+            masked_logits.scatter_(-1, top_indices, top_values)
+            return torch.softmax(masked_logits, dim=-1)
+        return torch.softmax(logits, dim=-1)
+
+    def forward(
+        self,
+        values: torch.Tensor,
+        scale_emb: torch.Tensor,
+        *,
+        return_diagnostics: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        weights = self.routing_weights(values, scale_emb)
+        expert_outputs = []
+        expert_diagnostics: list[dict[str, torch.Tensor]] = []
+        for expert in self.experts:
+            if return_diagnostics:
+                out, diagnostics = expert(values, scale_emb, return_diagnostics=True)
+                expert_outputs.append(out)
+                expert_diagnostics.append(diagnostics)
+            else:
+                expert_outputs.append(expert(values, scale_emb))
+        stacked = torch.stack(expert_outputs, dim=-2)
+        adapted = (weights.unsqueeze(-1) * stacked).sum(dim=-2)
+        if not return_diagnostics:
+            return adapted
+
+        avg_prob = weights.mean(dim=(0, 1))
+        uniform = torch.full_like(avg_prob, 1.0 / self.n_experts)
+        token_entropy = -(weights * torch.log(weights + 1e-8)).sum(dim=-1).mean()
+        diagnostics: dict[str, torch.Tensor] = {
+            "router_entropy": token_entropy / math.log(self.n_experts),
+            "router_balance_loss": F.mse_loss(avg_prob, uniform),
+            "composite_mean_abs_delta": torch.mean(torch.abs(adapted - values)),
+        }
+        scale_prior_prob = torch.softmax(self.scale_router(scale_emb), dim=-1).mean(dim=0)
+        for expert_idx in range(self.n_experts):
+            diagnostics[f"expert_prob_{expert_idx}"] = avg_prob[expert_idx]
+            diagnostics[f"scale_prior_prob_{expert_idx}"] = scale_prior_prob[expert_idx]
+            if expert_diagnostics:
+                diagnostics[f"expert_{expert_idx}_asd_gate_mean"] = expert_diagnostics[expert_idx]["asd_gate_mean"]
+                diagnostics[f"expert_{expert_idx}_asd_tau_mean"] = expert_diagnostics[expert_idx]["asd_tau_mean"]
+                diagnostics[f"expert_{expert_idx}_enhance_gate_mean"] = expert_diagnostics[expert_idx][
+                    "enhance_gate_mean"
+                ]
+                diagnostics[f"expert_{expert_idx}_kind_id"] = expert_diagnostics[expert_idx]["adapter_kind_id"]
+        return adapted, diagnostics
+
+
+class RoutedCompositeASDAdapterPatchTST(nn.Module):
+    """Use routed ASD+LoRA/MLP composite experts with a protected raw residual path."""
+
+    def __init__(
+        self,
+        backbone: MultiScalePatchTST,
+        *,
+        init_gate: float = -4.0,
+        n_experts: int = 4,
+        rank: int = 8,
+        alpha: float = 16.0,
+        bottleneck: int = 8,
+        top_k: int = 2,
+        dropout: float = 0.1,
+        expert_pattern: str = "one_mlp",
+        final_gate_init: float = -2.0,
+    ) -> None:
+        super().__init__()
+        if backbone.input_channels != 1:
+            raise ValueError("RoutedCompositeASDAdapterPatchTST expects one input channel.")
+        if n_experts <= 0:
+            raise ValueError("n_experts must be positive.")
+        if expert_pattern == "alternating":
+            expert_kinds = tuple("lora" if idx % 2 == 0 else "mlp" for idx in range(n_experts))
+        elif expert_pattern == "lora_first":
+            split = max(1, n_experts // 2)
+            expert_kinds = tuple("lora" if idx < split else "mlp" for idx in range(n_experts))
+        elif expert_pattern == "all_lora":
+            expert_kinds = tuple("lora" for _ in range(n_experts))
+        elif expert_pattern == "all_mlp":
+            expert_kinds = tuple("mlp" for _ in range(n_experts))
+        elif expert_pattern == "one_mlp":
+            expert_kinds = tuple("mlp" if idx == n_experts - 1 else "lora" for idx in range(n_experts))
+        elif expert_pattern == "three_mlp":
+            mlp_count = min(3, n_experts)
+            expert_kinds = tuple("lora" if idx < n_experts - mlp_count else "mlp" for idx in range(n_experts))
+        else:
+            raise ValueError(
+                "expert_pattern must be one of 'alternating', 'lora_first', "
+                "'all_lora', 'all_mlp', 'one_mlp', or 'three_mlp'."
+            )
+        self.backbone = backbone
+        self.composite_moe = CompositeASDAdapterMoE(
+            backbone.d_model,
+            max_context_length=max(spec.context_length for spec in backbone.scale_specs.values()),
+            input_channels=1,
+            expert_kinds=expert_kinds,
+            rank=rank,
+            alpha=alpha,
+            bottleneck=bottleneck,
+            top_k=top_k,
+            dropout=dropout,
+            init_gate=init_gate,
+        )
+        self.final_gate_projection = nn.Linear(backbone.d_model, 1)
+        nn.init.zeros_(self.final_gate_projection.weight)
+        nn.init.constant_(self.final_gate_projection.bias, final_gate_init)
+
+    def forward(
+        self,
+        past_values: torch.Tensor,
+        scale_name: str,
+        *,
+        return_diagnostics: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if scale_name not in self.backbone.scale_specs:
+            raise ValueError(f"unknown scale {scale_name!r}; expected {sorted(self.backbone.scale_specs)}")
+        spec = self.backbone.scale_specs[scale_name]
+        if past_values.ndim != 3:
+            raise ValueError(f"past_values must be [B,L,C], got {tuple(past_values.shape)}")
+        if past_values.shape[1] != spec.context_length:
+            raise ValueError(f"{scale_name}: input length must be {spec.context_length}, got {past_values.shape[1]}")
+
+        scale_emb = self.backbone.scale_embedding_for(scale_name, past_values.shape[0], past_values.device)
+        adapted, moe_diagnostics = self.composite_moe(past_values, scale_emb, return_diagnostics=True)
+        final_gate = torch.sigmoid(self.final_gate_projection(scale_emb))[:, None, :]
+        patch_input = past_values + final_gate * (adapted - past_values)
+        out = self.backbone(patch_input, scale_name, return_diagnostics=return_diagnostics)
+        if not return_diagnostics:
+            return out
+        if isinstance(out, tuple):
+            y, backbone_diagnostics = out
+        else:
+            y, backbone_diagnostics = out, {}
+        diagnostics: dict[str, torch.Tensor] = {
+            "final_gate_mean": torch.mean(final_gate),
+            "final_mean_abs_delta": torch.mean(torch.abs(patch_input - past_values)),
+            "patch_input_abs_mean": torch.mean(torch.abs(patch_input)),
+        }
+        diagnostics.update(moe_diagnostics)
+        diagnostics.update(backbone_diagnostics)
+        diagnostics.update({f"backbone_{key}": value for key, value in backbone_diagnostics.items()})
+        return y, diagnostics
+
+
 class LevelASDMultiScalePatchTST(nn.Module):
     """Apply scale-aware spectral denoising to log-price levels, then difference."""
 
